@@ -75,6 +75,27 @@ pub fn build(b: *std.Build) void {
         step.dependOn(&run.step);
     }
 
+    // --- Callgrind instructions/op (BENCH_SPEC.md) ----------------------------
+    // Built, not run: bench/run_callgrind.sh drives the installed binary under
+    // valgrind. Symbols are kept so `--toggle-collect=run_<workload>` matches.
+    {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("bench/callgrind.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = false,
+        });
+        mod.addImport("sofab", b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }));
+        const exe = b.addExecutable(.{ .name = "callgrind", .root_module = mod });
+        const install = b.addInstallArtifact(exe, .{});
+        const step = b.step("callgrind", "Build the Callgrind instructions/op tool (run via bench/run_callgrind.sh)");
+        step.dependOn(&install.step);
+    }
+
     // --- docs ------------------------------------------------------------------
     const docs_obj = b.addObject(.{ .name = "sofab", .root_module = sofab });
     const install_docs = b.addInstallDirectory(.{
