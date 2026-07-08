@@ -1,0 +1,16 @@
+.{
+    // Package name per the family convention: "sofa-buffers" + "corelib",
+    // delimited as a Zig identifier. The importable module namespace is `sofab`.
+    .name = .sofa_buffers_corelib,
+    .version = "0.1.0",
+    .fingerprint = 0xfda8ef6816eb070c, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "assets",
+        "LICENSE",
+        "README.md",
+    },
+}

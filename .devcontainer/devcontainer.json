@@ -1,0 +1,12 @@
+{
+  "name": "Zig",
+  "build": { "dockerfile": "Dockerfile" },
+  // Load local secrets (GitHub token, etc.) from .devcontainer/.env.
+  // Copy .env.example to .env first; the real .env is gitignored.
+  "runArgs": ["--env-file", "${localWorkspaceFolder}/.devcontainer/.env"],
+  "customizations": {
+    "vscode": {
+      "extensions": ["ziglang.vscode-zig", "anthropic.claude-code"]
+    }
+  }
+}

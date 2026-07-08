@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  # Formatting, denying any unformatted file.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig fmt --check build.zig src tests bench
+
+  # Build + full test suite (incl. the shared vectors from assets/) in both
+  # optimize modes: Debug keeps all safety checks; ReleaseFast is the shipping
+  # config this port is tuned for. Zig has a single upstream toolchain and the
+  # library tracks one pinned version (no_std-style version matrices don't
+  # apply), so a single pinned leg is used per ARCHITECTURE §12.1.
+  test:
+    name: Test (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Build
+        run: zig build ${{ matrix.mode == 'release' && '--release=fast' || '' }}
+      - name: Test
+        run: zig build test ${{ matrix.mode == 'release' && '--release=fast' || '' }}
+      - name: Smoke-run the benchmark tools
+        if: matrix.mode == 'release'
+        run: |
+          zig build perf
+          zig build bench
+
+  # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
+  # little-endian wire format round-trips correctly off little-endian hardware.
+  test-big-endian:
+    name: Test (big-endian, s390x)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install QEMU user emulation
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          # Zig invokes the interpreter as `qemu-s390x`; Ubuntu ships it as
+          # `qemu-s390x-static`.
+          sudo ln -sf /usr/bin/qemu-s390x-static /usr/local/bin/qemu-s390x
+      - run: zig build test -Dtarget=s390x-linux -fqemu
+
+  # Line coverage via kcov over the test binaries; publishes the README's
+  # coverage badge from main.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the badge JSON to the `badges` branch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # kcov is not packaged for Ubuntu 24.04 — build the pinned release.
+      - name: Build kcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ binutils-dev libdw-dev libiberty-dev \
+            libcurl4-openssl-dev zlib1g-dev libssl-dev jq
+          curl -fsSL https://github.com/SimonKagstrom/kcov/archive/refs/tags/v43.tar.gz | tar xz -C /tmp
+          cmake -S /tmp/kcov-43 -B /tmp/kcov-43/build -DCMAKE_BUILD_TYPE=Release
+          make -C /tmp/kcov-43/build -j"$(nproc)"
+          sudo make -C /tmp/kcov-43/build install
+
+      - name: Measure coverage
+        run: |
+          ./coverage.sh
+          PCT=$(jq -r '.percent_covered' coverage/merged/kcov-merged/coverage.json)
+          echo "COVERAGE_PCT=$PCT" >> "$GITHUB_ENV"
+
+      - name: Publish coverage badge
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/publish-coverage-badge.sh
