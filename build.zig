@@ -24,8 +24,10 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // --- tests ---------------------------------------------------------------
+    // The LLVM backend keeps the tests' DWARF readable by kcov (the default
+    // self-hosted x86_64 backend yields 0% coverage there).
     // In-source unit tests (varint/ostream/istream internals).
-    const unit_tests = b.addTest(.{ .name = "unit-tests", .root_module = sofab });
+    const unit_tests = b.addTest(.{ .name = "unit-tests", .root_module = sofab, .use_llvm = true });
 
     // Conformance suite: shared test vectors + chunked/malformed/skip scenarios.
     const tests_mod = b.createModule(.{
@@ -38,7 +40,7 @@ pub fn build(b: *std.Build) void {
     tests_mod.addAnonymousImport("test_vectors", .{
         .root_source_file = b.path("assets/test_vectors.json"),
     });
-    const conformance_tests = b.addTest(.{ .name = "conformance-tests", .root_module = tests_mod });
+    const conformance_tests = b.addTest(.{ .name = "conformance-tests", .root_module = tests_mod, .use_llvm = true });
 
     const test_step = b.step("test", "Run unit + conformance tests (incl. shared vectors)");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
