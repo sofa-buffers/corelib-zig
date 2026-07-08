@@ -93,7 +93,7 @@ jobs:
       - name: Measure coverage
         run: |
           ./coverage.sh
-          PCT=$(jq -r '.percent_covered' coverage/merged/kcov-merged/coverage.json)
+          PCT=$(jq -r '.percent_covered' "$(find coverage/merged -name coverage.json | head -1)")
           echo "COVERAGE_PCT=$PCT" >> "$GITHUB_ENV"
 
       - name: Publish coverage badge

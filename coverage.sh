@@ -14,10 +14,12 @@ cd "$(dirname "$0")"
 
 zig build install-tests
 rm -rf coverage
+# kcov creates its output directory but not the parent.
+mkdir -p coverage
 
 kcov --include-path="$PWD/src" coverage/unit zig-out/bin/unit-tests >/dev/null
 kcov --include-path="$PWD/src" coverage/conformance zig-out/bin/conformance-tests >/dev/null
 kcov --merge coverage/merged coverage/unit coverage/conformance >/dev/null
 
-PCT=$(jq -r '.percent_covered' coverage/merged/kcov-merged/coverage.json)
+PCT=$(jq -r '.percent_covered' "$(find coverage/merged -name coverage.json | head -1)")
 echo "line coverage: ${PCT}%"
