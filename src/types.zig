@@ -61,6 +61,25 @@ pub const Error = error{
     /// reported distinctly from `InvalidMessage` so a caller can tell "need more
     /// bytes" apart from "this can never be valid".
     Incomplete,
+
+    /// A decoded dynamic field exceeded a **receiver-configured** decode limit
+    /// on an unbounded field — one whose schema declares no `count`/`maxlen`
+    /// (`max_dyn_array_count`, `max_dyn_string_len`, `max_dyn_blob_len`). The
+    /// bytes are a well-formed Sofab message; whether they are *accepted*
+    /// depends on the receiver's policy, so this is deliberately **distinct
+    /// from `InvalidMessage`**: a limit violation is policy, not wire
+    /// malformation. Keeping the two apart lets a differential fuzzer (Crucible)
+    /// avoid reading two backends' differing configured limits as a
+    /// wire-conformance divergence.
+    ///
+    /// A limit violation is always a hard decode error (never clamp, never
+    /// truncate), raised **before** any allocation for the offending field.
+    ///
+    /// This corelib neither enforces these limits nor defines any default
+    /// values: the caps come from the sofabgen config and the enforcement lives
+    /// in generated decode code, which raises this category uniformly. See
+    /// sofa-buffers/generator#102; mirrors corelib-go's `ErrLimitExceeded`.
+    LimitExceeded,
 };
 
 // --- 3-bit wire field type tags (low 3 bits of the field header varint) ------
