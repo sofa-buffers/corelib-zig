@@ -47,11 +47,20 @@ pub const Error = error{
     /// Corresponds to `SOFAB_RET_E_BUFFER_FULL`.
     BufferFull,
 
-    /// The input bytes are not a valid Sofab message (varint overflow, bad
-    /// type tag, oversized length/count, dangling sequence end, nesting past
-    /// `MAX_DEPTH`, truncated message, …).
+    /// The input bytes are not a valid Sofab message *regardless of what may
+    /// follow* (varint overflow, bad type tag, oversized length/count, dangling
+    /// sequence end, nesting past `MAX_DEPTH`, invalid UTF-8, …).
     /// Corresponds to `SOFAB_RET_E_INVALID_MSG`.
     InvalidMessage,
+
+    /// The input bytes are well-formed so far but end **inside** a field — an
+    /// unterminated varint, a fixlen/array payload shorter than its declared
+    /// length, an array whose elements run off the end, or a nested sequence
+    /// left open. This is **not** malformed input: more bytes could complete
+    /// the message, and the caller owns end-of-input (MESSAGE_SPEC §7). It is
+    /// reported distinctly from `InvalidMessage` so a caller can tell "need more
+    /// bytes" apart from "this can never be valid".
+    Incomplete,
 };
 
 // --- 3-bit wire field type tags (low 3 bits of the field header varint) ------

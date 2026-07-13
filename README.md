@@ -152,15 +152,24 @@ try sofab.decode(message, &sink);
 
 `IStream.feed` takes chunks of any size, suspends/resumes at any byte boundary,
 and drives the same visitor — so it decodes whatever the transport hands you.
-`finish()` asserts a clean message boundary:
+`finish()` reports the message-boundary status once the transport is drained: it
+returns normally at a clean field boundary and `error.Incomplete` when the bytes
+ended inside a field or with a sequence still open. Truncation is **not** an
+error the decoder invents — the caller owns end-of-input and decides, from its
+own framing, whether a trailing `error.Incomplete` is a truncation failure
+(MESSAGE_SPEC §7). Malformed bytes are still rejected as `error.InvalidMessage`
+by `feed` itself.
 
 ```zig
 var sink: My = .{};
 var is = sofab.IStream.init();
 while (transport.nextChunk()) |chunk| { // 7 bytes at a time, or 1, or 64k
-    try is.feed(chunk, &sink);
+    try is.feed(chunk, &sink); // error.InvalidMessage on malformed input
 }
-try is.finish();
+is.finish() catch |err| switch (err) {
+    error.Incomplete => {}, // stream ended mid-message: your framing decides
+    else => return err,
+};
 ```
 
 ### Code generator

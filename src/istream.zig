@@ -130,11 +130,23 @@ pub const IStream = struct {
         }
     }
 
-    /// Assert the decoder is at a clean message boundary: no half-read field,
-    /// no open sequence. Used by `decode` to reject truncated input.
+    /// Report the decoder's outcome at the point the caller has run out of
+    /// input (MESSAGE_SPEC §7). This is a pure accessor — it never mutates the
+    /// decoder and never promotes an incomplete decode into an error:
+    ///
+    /// * returns normally (COMPLETE) when the bytes fed so far end exactly at a
+    ///   field boundary — a valid whole message;
+    /// * returns `error.Incomplete` (INCOMPLETE) when a field is half-read
+    ///   (`carry_len != 0`), a long payload/array is still in progress
+    ///   (`state != .none`), or a sequence is still open (`depth != 0`). The
+    ///   caller — which owns end-of-input — decides from its own framing whether
+    ///   a trailing INCOMPLETE is a truncation error or simply a short read.
+    ///
+    /// Genuinely-malformed input never reaches here: it is rejected with
+    /// `error.InvalidMessage` while `feed`/`parse` is still consuming bytes.
     pub fn finish(self: *const IStream) Error!void {
         if (self.carry_len != 0 or self.state != .none or self.depth != 0) {
-            return Error.InvalidMessage;
+            return Error.Incomplete;
         }
     }
 
@@ -355,11 +367,21 @@ inline fn emitFixlenValue(buf: []const u8, pos: usize, fp64: bool, id: Id, visit
     }
 }
 
-/// Decode a complete, contiguous message in one shot — the fast zero-copy path.
+/// Decode a contiguous message in one shot — the fast zero-copy path.
 ///
-/// `buf` must contain the entire message. Every field is pushed to `visitor`;
-/// string/blob payloads are delivered as a single borrowed slice with no copy.
-/// Returns `error.InvalidMessage` if the bytes are truncated or malformed.
+/// Every field is pushed to `visitor`; string/blob payloads are delivered as a
+/// single borrowed slice with no copy. Surfaces the three-valued outcome of
+/// MESSAGE_SPEC §7, identically to the streaming path:
+///
+/// * returns normally (COMPLETE) — `buf` is a valid whole message ending at a
+///   field boundary;
+/// * `error.Incomplete` (INCOMPLETE) — `buf` ends inside a field or with a
+///   sequence still open; more bytes could complete it. This is **not** a
+///   rejection — the caller owns end-of-input and decides whether a truncated
+///   trailing item is an error for its framing;
+/// * `error.InvalidMessage` (INVALID) — `buf` is malformed regardless of what
+///   might follow (bad tag, >64-bit varint, oversized length/count, dangling
+///   sequence end, nesting past `MAX_DEPTH`, …).
 pub fn decode(buf: []const u8, visitor: anytype) Error!void {
     var is = IStream.init();
     try is.feed(buf, visitor);
@@ -466,12 +488,29 @@ test "visitor with no callbacks skips everything (auto-skip)" {
     try decode(buf[0..used], &sink);
 }
 
-test "truncated message is rejected by finish" {
+test "truncated message reports Incomplete, not rejection" {
+    // The sample ends with a sequence-end byte; dropping it leaves a sequence
+    // open at end-of-input. Per MESSAGE_SPEC §7 that is INCOMPLETE (more bytes
+    // could close it), distinct from both COMPLETE and INVALID — never promoted
+    // to error.InvalidMessage.
     var buf: [128]u8 = undefined;
     const used = encodeSample(&buf);
     const Nothing = struct {};
     var sink: Nothing = .{};
-    try testing.expectError(Error.InvalidMessage, decode(buf[0 .. used - 1], &sink));
+    try testing.expectError(Error.Incomplete, decode(buf[0 .. used - 1], &sink));
+}
+
+test "lone dangling 0x80 is Incomplete; a >64-bit varint is InvalidMessage" {
+    const Nothing = struct {};
+    // A single 0x80 (continuation bit set, no terminating byte) ends inside a
+    // varint: INCOMPLETE, not INVALID.
+    var sink: Nothing = .{};
+    try testing.expectError(Error.Incomplete, decode(&.{0x80}, &sink));
+
+    // Eleven continuation bytes overflow any u64 varint: malformed regardless
+    // of what follows, so INVALID.
+    var sink2: Nothing = .{};
+    try testing.expectError(Error.InvalidMessage, decode(&([_]u8{0x80} ** 11), &sink2));
 }
 
 test "dangling sequence end is rejected" {
