@@ -172,6 +172,14 @@ is.finish() catch |err| switch (err) {
 };
 ```
 
+The error set also carries `error.LimitExceeded`, for a **receiver-configured**
+decode limit on an unbounded field (`max_dyn_array_count`, `max_dyn_string_len`,
+`max_dyn_blob_len`). This corelib never raises it and defines no default limits —
+the caps come from the sofabgen config and are enforced in generated decode code,
+which raises this category before allocating. It is deliberately distinct from
+`error.InvalidMessage`: exceeding a receiver limit is policy, not wire
+malformation (see [`generator#102`](https://github.com/sofa-buffers/generator/issues/102)).
+
 ### Code generator
 
 Usually you never touch the raw API: the

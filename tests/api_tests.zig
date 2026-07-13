@@ -25,4 +25,28 @@ test "error baseline (§6.3) is exposed" {
     // INCOMPLETE is a distinct outcome (MESSAGE_SPEC §7), not folded into
     // InvalidMessage.
     try std.testing.expectError(E.Incomplete, @as(E!void, E.Incomplete));
+    // LIMIT_EXCEEDED is a distinct policy outcome (generator#102), exposed for
+    // generated decode code to report a receiver-configured limit violation.
+    try std.testing.expectError(E.LimitExceeded, @as(E!void, E.LimitExceeded));
+}
+
+test "LimitExceeded is distinguishable from InvalidMessage" {
+    // A limit violation is receiver policy, not wire malformation — the two must
+    // never collapse to the same value, or a differential fuzzer would read a
+    // backend's configured limit as a wire-conformance divergence.
+    const E = sofab.Error;
+    try std.testing.expect(E.LimitExceeded != E.InvalidMessage);
+
+    // A caller (e.g. generated decode code) can switch the two apart.
+    const classify = struct {
+        fn f(e: E) []const u8 {
+            return switch (e) {
+                E.LimitExceeded => "policy",
+                E.InvalidMessage => "malformed",
+                else => "other",
+            };
+        }
+    }.f;
+    try std.testing.expectEqualStrings("policy", classify(E.LimitExceeded));
+    try std.testing.expectEqualStrings("malformed", classify(E.InvalidMessage));
 }
