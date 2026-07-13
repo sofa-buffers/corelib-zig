@@ -22,4 +22,7 @@ test "error baseline (§6.3) is exposed" {
     try std.testing.expectError(E.UsageError, @as(E!void, E.UsageError));
     try std.testing.expectError(E.BufferFull, @as(E!void, E.BufferFull));
     try std.testing.expectError(E.InvalidMessage, @as(E!void, E.InvalidMessage));
+    // INCOMPLETE is a distinct outcome (MESSAGE_SPEC §7), not folded into
+    // InvalidMessage.
+    try std.testing.expectError(E.Incomplete, @as(E!void, E.Incomplete));
 }

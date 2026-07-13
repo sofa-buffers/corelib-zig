@@ -1,7 +1,11 @@
-//! Malformed-input tests (ARCHITECTURE §7.2, item 5): truncated varints,
-//! overlong varints, unbalanced sequence ends, oversized lengths/counts and
-//! reserved subtypes must all yield `error.InvalidMessage` — never a crash —
-//! whether fed whole or split at hostile byte boundaries.
+//! Malformed-input tests (ARCHITECTURE §7.2, item 5): overlong varints,
+//! dangling sequence ends, oversized lengths/counts and reserved subtypes are
+//! INVALID regardless of what follows and must all yield `error.InvalidMessage`
+//! — never a crash — whether fed whole or split at hostile byte boundaries.
+//!
+//! Truncation is a separate outcome (MESSAGE_SPEC §7): input that merely ends
+//! inside a field or with a sequence still open is INCOMPLETE, reported as
+//! `error.Incomplete`, never promoted to `error.InvalidMessage`.
 
 const std = @import("std");
 const sofab = @import("sofab");
@@ -30,7 +34,28 @@ fn expectInvalidWholeAndChunked(bytes: []const u8) !void {
     try std.testing.expectError(error.InvalidMessage, chunked);
 }
 
-test "truncated inputs are rejected at finish" {
+fn expectIncompleteWholeAndChunked(bytes: []const u8) !void {
+    // Whole-buffer feed: `feed` buffers a partial tail and returns OK; the
+    // incomplete outcome surfaces from `finish` as `error.Incomplete`.
+    var sink: Nothing = .{};
+    var is = sofab.IStream.init();
+    const whole: anyerror!void = blk: {
+        is.feed(bytes, &sink) catch |e| break :blk e;
+        break :blk is.finish();
+    };
+    try std.testing.expectError(error.Incomplete, whole);
+
+    // One byte at a time: still INCOMPLETE at end-of-input, never promoted.
+    var sink2: Nothing = .{};
+    var is2 = sofab.IStream.init();
+    const chunked: anyerror!void = blk: {
+        for (bytes) |b| is2.feed(&.{b}, &sink2) catch |e| break :blk e;
+        break :blk is2.finish();
+    };
+    try std.testing.expectError(error.Incomplete, chunked);
+}
+
+test "truncated inputs are Incomplete, not rejected" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -55,7 +80,7 @@ test "truncated inputs are rejected at finish" {
             is.feed(message[0..cut], &rec) catch |e| break :blk e;
             break :blk is.finish();
         };
-        try std.testing.expectError(error.InvalidMessage, r);
+        try std.testing.expectError(error.Incomplete, r);
     }
 }
 
@@ -68,12 +93,16 @@ test "overlong and overflowing varints are rejected" {
 }
 
 test "unbalanced sequence framing is rejected" {
-    // End without a start.
+    // End without a start: a dangling sequence-end can never be valid → INVALID.
     try expectInvalidWholeAndChunked(&.{0x07});
-    // Balanced pair, then a stray end.
+    // Balanced pair, then a stray end → INVALID.
     try expectInvalidWholeAndChunked(&.{ 0x0E, 0x07, 0x07 });
-    // Start without an end (caught by finish()).
-    try expectInvalidWholeAndChunked(&.{0x0E});
+}
+
+test "an unclosed sequence is Incomplete, not rejected" {
+    // Start without an end: the sequence could still be closed by more bytes,
+    // so this is INCOMPLETE (MESSAGE_SPEC §7), not INVALID.
+    try expectIncompleteWholeAndChunked(&.{0x0E});
 }
 
 test "nesting past MAX_DEPTH is rejected" {
