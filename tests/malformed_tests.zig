@@ -4,8 +4,8 @@
 //! — never a crash — whether fed whole or split at hostile byte boundaries.
 //!
 //! Truncation is a separate outcome (MESSAGE_SPEC §7): input that merely ends
-//! inside a field or with a sequence still open is INCOMPLETE, reported as
-//! `error.Incomplete`, never promoted to `error.InvalidMessage`.
+//! inside a field or with a sequence still open is INCOMPLETE, reported as the
+//! `.incomplete` decode `Status`, never promoted to `error.InvalidMessage`.
 
 const std = @import("std");
 const sofab = @import("sofab");
@@ -14,45 +14,34 @@ const common = @import("common.zig");
 const Nothing = struct {};
 
 fn expectInvalidWholeAndChunked(bytes: []const u8) !void {
-    // Whole-buffer feed + finish.
+    // Whole-buffer feed: the malformed item is rejected eagerly by `feed`.
     var sink: Nothing = .{};
     var is = sofab.IStream.init();
-    const whole: anyerror!void = blk: {
-        is.feed(bytes, &sink) catch |e| break :blk e;
-        break :blk is.finish();
-    };
-    try std.testing.expectError(error.InvalidMessage, whole);
+    try std.testing.expectError(error.InvalidMessage, is.feed(bytes, &sink));
 
     // One byte at a time: the same error must surface, at whichever feed
     // completes (or ends) the malformed item.
     var sink2: Nothing = .{};
     var is2 = sofab.IStream.init();
-    const chunked: anyerror!void = blk: {
-        for (bytes) |b| is2.feed(&.{b}, &sink2) catch |e| break :blk e;
-        break :blk is2.finish();
+    const chunked: anyerror!sofab.Status = blk: {
+        for (bytes) |b| _ = is2.feed(&.{b}, &sink2) catch |e| break :blk e;
+        break :blk is2.status();
     };
     try std.testing.expectError(error.InvalidMessage, chunked);
 }
 
 fn expectIncompleteWholeAndChunked(bytes: []const u8) !void {
-    // Whole-buffer feed: `feed` buffers a partial tail and returns OK; the
-    // incomplete outcome surfaces from `finish` as `error.Incomplete`.
+    // Whole-buffer feed: `feed` buffers a partial tail and returns the
+    // `.incomplete` status — never an error.
     var sink: Nothing = .{};
     var is = sofab.IStream.init();
-    const whole: anyerror!void = blk: {
-        is.feed(bytes, &sink) catch |e| break :blk e;
-        break :blk is.finish();
-    };
-    try std.testing.expectError(error.Incomplete, whole);
+    try std.testing.expectEqual(sofab.Status.incomplete, try is.feed(bytes, &sink));
 
     // One byte at a time: still INCOMPLETE at end-of-input, never promoted.
     var sink2: Nothing = .{};
     var is2 = sofab.IStream.init();
-    const chunked: anyerror!void = blk: {
-        for (bytes) |b| is2.feed(&.{b}, &sink2) catch |e| break :blk e;
-        break :blk is2.finish();
-    };
-    try std.testing.expectError(error.Incomplete, chunked);
+    for (bytes) |b| _ = try is2.feed(&.{b}, &sink2);
+    try std.testing.expectEqual(sofab.Status.incomplete, is2.status());
 }
 
 test "truncated inputs are Incomplete, not rejected" {
@@ -76,11 +65,9 @@ test "truncated inputs are Incomplete, not rejected" {
     while (cut < message.len) : (cut += 1) {
         var rec = common.Recorder.init(arena);
         var is = sofab.IStream.init();
-        const r: anyerror!void = blk: {
-            is.feed(message[0..cut], &rec) catch |e| break :blk e;
-            break :blk is.finish();
-        };
-        try std.testing.expectError(error.Incomplete, r);
+        // Every strict prefix is well-formed so far but unfinished: INCOMPLETE,
+        // surfaced as a status, never an error.
+        try std.testing.expectEqual(sofab.Status.incomplete, try is.feed(message[0..cut], &rec));
     }
 }
 

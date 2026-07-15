@@ -22,12 +22,17 @@ test "error baseline (§6.3) is exposed" {
     try std.testing.expectError(E.UsageError, @as(E!void, E.UsageError));
     try std.testing.expectError(E.BufferFull, @as(E!void, E.BufferFull));
     try std.testing.expectError(E.InvalidMessage, @as(E!void, E.InvalidMessage));
-    // INCOMPLETE is a distinct outcome (MESSAGE_SPEC §7), not folded into
-    // InvalidMessage.
-    try std.testing.expectError(E.Incomplete, @as(E!void, E.Incomplete));
     // LIMIT_EXCEEDED is a distinct policy outcome (generator#102), exposed for
     // generated decode code to report a receiver-configured limit violation.
     try std.testing.expectError(E.LimitExceeded, @as(E!void, E.LimitExceeded));
+}
+
+test "INCOMPLETE is a distinct decode status, not an error (MESSAGE_SPEC §7)" {
+    // The three-valued streaming outcome surfaces INCOMPLETE as a `Status`
+    // value returned from `feed`/`status` — never promoted into the
+    // `InvalidMessage` error channel, and never via a `finish()`/`finalize()`
+    // call (the plan forbids one; §5, §6.1).
+    try std.testing.expect(sofab.Status.incomplete != sofab.Status.complete);
 }
 
 test "LimitExceeded is distinguishable from InvalidMessage" {

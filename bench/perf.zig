@@ -96,7 +96,7 @@ const PerfOut = struct {
 
 fn perfDecode(buf: []const u8, out: *PerfOut) void {
     var is = sofab.IStream.init();
-    is.feed(buf, out) catch unreachable;
+    _ = is.feed(buf, out) catch unreachable;
 }
 
 // ---------------------------------------------------------------------------

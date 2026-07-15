@@ -53,15 +53,6 @@ pub const Error = error{
     /// Corresponds to `SOFAB_RET_E_INVALID_MSG`.
     InvalidMessage,
 
-    /// The input bytes are well-formed so far but end **inside** a field — an
-    /// unterminated varint, a fixlen/array payload shorter than its declared
-    /// length, an array whose elements run off the end, or a nested sequence
-    /// left open. This is **not** malformed input: more bytes could complete
-    /// the message, and the caller owns end-of-input (MESSAGE_SPEC §7). It is
-    /// reported distinctly from `InvalidMessage` so a caller can tell "need more
-    /// bytes" apart from "this can never be valid".
-    Incomplete,
-
     /// A decoded dynamic field exceeded a **receiver-configured** decode limit
     /// on an unbounded field — one whose schema declares no `count`/`maxlen`
     /// (`max_dyn_array_count`, `max_dyn_string_len`, `max_dyn_blob_len`). The

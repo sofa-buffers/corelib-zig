@@ -37,7 +37,7 @@
 //!     }
 //! };
 //! var sink: Sink = .{};
-//! try sofab.decode(message, &sink);
+//! _ = try sofab.decode(message, &sink); // returns .complete / .incomplete
 //! ```
 
 const types = @import("types.zig");
@@ -56,6 +56,7 @@ pub const OStream = @import("ostream.zig").OStream;
 pub const FlushFn = @import("ostream.zig").FlushFn;
 
 pub const IStream = @import("istream.zig").IStream;
+pub const Status = @import("istream.zig").Status;
 pub const decode = @import("istream.zig").decode;
 
 test {
