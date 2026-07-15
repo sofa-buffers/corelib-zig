@@ -283,15 +283,15 @@ fn expectedEventsWithSkip(arena: std.mem.Allocator, fields: []const std.json.Val
 
 fn decodeAll(arena: std.mem.Allocator, bytes: []const u8) ![]const Event {
     var rec = common.Recorder.init(arena);
-    try sofab.decode(bytes, &rec);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(bytes, &rec));
     return rec.events.items;
 }
 
 fn decodeOneByteAtATime(arena: std.mem.Allocator, bytes: []const u8) ![]const Event {
     var rec = common.Recorder.init(arena);
     var is = sofab.IStream.init();
-    for (bytes) |b| try is.feed(&.{b}, &rec);
-    try is.finish();
+    for (bytes) |b| _ = try is.feed(&.{b}, &rec);
+    try std.testing.expectEqual(sofab.Status.complete, is.status());
     return rec.events.items;
 }
 
@@ -378,13 +378,13 @@ test "skip_ids vectors conform (whole and chunked)" {
         try std.testing.expect(want.len < expectedEvents(arena, fields).len);
 
         var rec = common.SkipRecorder.init(arena, skip);
-        try sofab.decode(bytes, &rec);
+        try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(bytes, &rec));
         try common.expectEventsEqual(want, rec.events());
 
         var rec2 = common.SkipRecorder.init(arena, skip);
         var is = sofab.IStream.init();
-        for (bytes) |b| try is.feed(&.{b}, &rec2);
-        try is.finish();
+        for (bytes) |b| _ = try is.feed(&.{b}, &rec2);
+        try std.testing.expectEqual(sofab.Status.complete, is.status());
         try common.expectEventsEqual(want, rec2.events());
     }
 

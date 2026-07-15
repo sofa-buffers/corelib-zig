@@ -61,14 +61,14 @@ export fn run_encode_typical() void {
 export fn run_decode_u64_array() void {
     var sink: util.Checksum = .{};
     var is = sofab.IStream.init();
-    is.feed(u64_msg, &sink) catch unreachable;
+    _ = is.feed(u64_msg, &sink) catch unreachable;
     std.mem.doNotOptimizeAway(sink.acc);
 }
 
 export fn run_decode_typical() void {
     var sink: util.Checksum = .{};
     var is = sofab.IStream.init();
-    is.feed(typ_msg, &sink) catch unreachable;
+    _ = is.feed(typ_msg, &sink) catch unreachable;
     std.mem.doNotOptimizeAway(sink.acc);
 }
 

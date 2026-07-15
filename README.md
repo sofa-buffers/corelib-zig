@@ -144,7 +144,7 @@ const My = struct {
 };
 
 var sink: My = .{};
-try sofab.decode(message, &sink);
+_ = try sofab.decode(message, &sink); // .complete at a clean message boundary
 // sink.a == 42, sink.b == -7, sink.s[0..sink.s_len] == "hi"
 ```
 
@@ -152,24 +152,26 @@ try sofab.decode(message, &sink);
 
 `IStream.feed` takes chunks of any size, suspends/resumes at any byte boundary,
 and drives the same visitor — so it decodes whatever the transport hands you.
-`finish()` reports the message-boundary status once the transport is drained: it
-returns normally at a clean field boundary and `error.Incomplete` when the bytes
-ended inside a field or with a sequence still open. Truncation is **not** an
-error the decoder invents — the caller owns end-of-input and decides, from its
-own framing, whether a trailing `error.Incomplete` is a truncation failure
-(MESSAGE_SPEC §7). Malformed bytes are still rejected as `error.InvalidMessage`
-by `feed` itself.
+`feed` returns the message-boundary `Status` after each chunk (`status()`
+re-queries it without feeding more): `.complete` at a clean field boundary and
+`.incomplete` when the bytes ended inside a field or with a sequence still open.
+There is **no** `finish()`/`finalize()` call — the outcome comes straight out of
+`feed(chunk)→status`. Truncation is **not** an error the decoder invents — the
+caller owns end-of-input and decides, from its own framing, whether a trailing
+`.incomplete` is a truncation failure (MESSAGE_SPEC §7). Malformed bytes are
+still rejected as `error.InvalidMessage` by `feed` itself.
 
 ```zig
 var sink: My = .{};
 var is = sofab.IStream.init();
+var status = sofab.Status.complete;
 while (transport.nextChunk()) |chunk| { // 7 bytes at a time, or 1, or 64k
-    try is.feed(chunk, &sink); // error.InvalidMessage on malformed input
+    status = try is.feed(chunk, &sink); // error.InvalidMessage on malformed input
 }
-is.finish() catch |err| switch (err) {
-    error.Incomplete => {}, // stream ended mid-message: your framing decides
-    else => return err,
-};
+switch (status) { // == is.status()
+    .complete => {},
+    .incomplete => {}, // stream ended mid-message: your framing decides
+}
 ```
 
 The error set also carries `error.LimitExceeded`, for a **receiver-configured**
@@ -208,7 +210,7 @@ const Point = struct {
 
     fn decode(data: []const u8) !Point {
         var p: Point = .{};
-        try sofab.decode(data, &p);
+        _ = try sofab.decode(data, &p);
         return p;
     }
 

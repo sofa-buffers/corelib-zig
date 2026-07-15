@@ -69,6 +69,23 @@ const Resume = union(enum) {
     array_fix: struct { id: Id, fp64: bool, remaining: usize },
 };
 
+/// The decode outcome at the point the caller has run out of input, per the
+/// three distinct outcomes of MESSAGE_SPEC §7. The third outcome, INVALID, is
+/// not represented here: malformed bytes are rejected eagerly with
+/// `error.InvalidMessage` while `feed`/`parse` is still consuming them, so a
+/// `Status` is only ever produced for input that is well-formed so far.
+pub const Status = enum {
+    /// The bytes fed so far end exactly at a field boundary — a valid whole
+    /// message (COMPLETE).
+    complete,
+    /// A field is half-read, a long payload/array is still in progress, or a
+    /// sequence is still open — more bytes could complete the message
+    /// (INCOMPLETE). This is **never** an error: the caller owns end-of-input
+    /// and decides, from its own framing, whether a trailing `.incomplete` is a
+    /// truncation failure or simply a short read.
+    incomplete,
+};
+
 /// Streaming Sofab decoder. Reusable across messages via `reset`. Owns no
 /// heap memory — all state lives inline in the struct.
 pub const IStream = struct {
@@ -95,10 +112,15 @@ pub const IStream = struct {
     /// Feed a chunk of encoded bytes, pushing decoded fields to `visitor` (a
     /// pointer to any struct implementing the callbacks it cares about).
     ///
-    /// Returns `error.InvalidMessage` on malformed input. Decoding can continue
-    /// across any number of `feed` calls; the decoder keeps all state
-    /// internally and suspends/resumes at any byte boundary.
-    pub fn feed(self: *IStream, chunk: []const u8, visitor: anytype) Error!void {
+    /// Returns the decode `Status` reached after consuming the chunk —
+    /// `.complete` if the bytes so far end at a field boundary, `.incomplete`
+    /// if an item is still in progress (the plan's `feed(chunk)→status` shape,
+    /// so no separate finalization call is needed). Malformed input is rejected
+    /// eagerly with `error.InvalidMessage`. Decoding can continue across any
+    /// number of `feed` calls; the decoder keeps all state internally and
+    /// suspends/resumes at any byte boundary. `status` re-queries the same value
+    /// without feeding more bytes.
+    pub fn feed(self: *IStream, chunk: []const u8, visitor: anytype) Error!Status {
         var input = chunk;
         // Finish a small item carried from the previous chunk: stitch input
         // bytes onto it until it completes, then fall through to the direct
@@ -119,7 +141,7 @@ pub const IStream = struct {
                 self.carry_len -= consumed;
             }
         }
-        if (self.carry_len > 0) return; // chunk exhausted, item still incomplete
+        if (self.carry_len > 0) return self.status(); // chunk exhausted, item still incomplete
 
         // Fast path: parse straight from the caller's slice, no copy.
         const consumed = try self.parse(input, visitor);
@@ -128,26 +150,33 @@ pub const IStream = struct {
             @memcpy(self.carry[0..rest.len], rest);
             self.carry_len = rest.len;
         }
+        return self.status();
     }
 
     /// Report the decoder's outcome at the point the caller has run out of
-    /// input (MESSAGE_SPEC §7). This is a pure accessor — it never mutates the
-    /// decoder and never promotes an incomplete decode into an error:
+    /// input (MESSAGE_SPEC §7), as a pure read-only accessor — it never mutates
+    /// the decoder and never turns an incomplete decode into an error. `feed`
+    /// already returns this value after each chunk; `status` lets a caller
+    /// re-query it at end-of-input without feeding more bytes. There is
+    /// deliberately no `finish()`/`finalize()` call: the plan's streaming
+    /// contract (§5, §6.1) surfaces the outcome through `feed(chunk)→status`
+    /// with no finalization step.
     ///
-    /// * returns normally (COMPLETE) when the bytes fed so far end exactly at a
-    ///   field boundary — a valid whole message;
-    /// * returns `error.Incomplete` (INCOMPLETE) when a field is half-read
-    ///   (`carry_len != 0`), a long payload/array is still in progress
-    ///   (`state != .none`), or a sequence is still open (`depth != 0`). The
-    ///   caller — which owns end-of-input — decides from its own framing whether
-    ///   a trailing INCOMPLETE is a truncation error or simply a short read.
+    /// * `.complete` when the bytes fed so far end exactly at a field boundary —
+    ///   a valid whole message;
+    /// * `.incomplete` when a field is half-read (`carry_len != 0`), a long
+    ///   payload/array is still in progress (`state != .none`), or a sequence is
+    ///   still open (`depth != 0`). The caller — which owns end-of-input —
+    ///   decides from its own framing whether a trailing `.incomplete` is a
+    ///   truncation error or simply a short read.
     ///
     /// Genuinely-malformed input never reaches here: it is rejected with
     /// `error.InvalidMessage` while `feed`/`parse` is still consuming bytes.
-    pub fn finish(self: *const IStream) Error!void {
-        if (self.carry_len != 0 or self.state != .none or self.depth != 0) {
-            return Error.Incomplete;
-        }
+    pub fn status(self: *const IStream) Status {
+        return if (self.carry_len != 0 or self.state != .none or self.depth != 0)
+            .incomplete
+        else
+            .complete;
     }
 
     /// Parse as many complete fields as possible from `buf`, returning the
@@ -373,19 +402,18 @@ inline fn emitFixlenValue(buf: []const u8, pos: usize, fp64: bool, id: Id, visit
 /// single borrowed slice with no copy. Surfaces the three-valued outcome of
 /// MESSAGE_SPEC §7, identically to the streaming path:
 ///
-/// * returns normally (COMPLETE) — `buf` is a valid whole message ending at a
-///   field boundary;
-/// * `error.Incomplete` (INCOMPLETE) — `buf` ends inside a field or with a
+/// * returns `.complete` (COMPLETE) — `buf` is a valid whole message ending at
+///   a field boundary;
+/// * returns `.incomplete` (INCOMPLETE) — `buf` ends inside a field or with a
 ///   sequence still open; more bytes could complete it. This is **not** a
 ///   rejection — the caller owns end-of-input and decides whether a truncated
 ///   trailing item is an error for its framing;
 /// * `error.InvalidMessage` (INVALID) — `buf` is malformed regardless of what
 ///   might follow (bad tag, >64-bit varint, oversized length/count, dangling
 ///   sequence end, nesting past `MAX_DEPTH`, …).
-pub fn decode(buf: []const u8, visitor: anytype) Error!void {
+pub fn decode(buf: []const u8, visitor: anytype) Error!Status {
     var is = IStream.init();
-    try is.feed(buf, visitor);
-    try is.finish();
+    return is.feed(buf, visitor);
 }
 
 // --- unit tests -----------------------------------------------------------------
@@ -450,7 +478,7 @@ test "one-shot decode delivers every field" {
     const used = encodeSample(&buf);
 
     var p: Probe = .{};
-    try decode(buf[0..used], &p);
+    try testing.expectEqual(Status.complete, try decode(buf[0..used], &p));
     try testing.expectEqual(@as(u64, 42 + 1 + (10 + 20 + 30) + 6 * 3 + 99 + 1), p.unsigned_sum);
     try testing.expectEqual(@as(i64, -7 + 2), p.signed_sum);
     try testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.5))), p.fp32_bits);
@@ -466,12 +494,12 @@ test "one-byte-at-a-time feed matches one-shot decode" {
     const used = encodeSample(&buf);
 
     var whole: Probe = .{};
-    try decode(buf[0..used], &whole);
+    try testing.expectEqual(Status.complete, try decode(buf[0..used], &whole));
 
     var chunked: Probe = .{};
     var is = IStream.init();
-    for (buf[0..used]) |b| try is.feed(&.{b}, &chunked);
-    try is.finish();
+    for (buf[0..used]) |b| _ = try is.feed(&.{b}, &chunked);
+    try testing.expectEqual(Status.complete, is.status());
 
     try testing.expectEqual(whole.unsigned_sum, chunked.unsigned_sum);
     try testing.expectEqual(whole.signed_sum, chunked.signed_sum);
@@ -485,7 +513,7 @@ test "visitor with no callbacks skips everything (auto-skip)" {
     const used = encodeSample(&buf);
     const Nothing = struct {};
     var sink: Nothing = .{};
-    try decode(buf[0..used], &sink);
+    _ = try decode(buf[0..used], &sink);
 }
 
 test "truncated message reports Incomplete, not rejection" {
@@ -497,7 +525,7 @@ test "truncated message reports Incomplete, not rejection" {
     const used = encodeSample(&buf);
     const Nothing = struct {};
     var sink: Nothing = .{};
-    try testing.expectError(Error.Incomplete, decode(buf[0 .. used - 1], &sink));
+    try testing.expectEqual(Status.incomplete, try decode(buf[0 .. used - 1], &sink));
 }
 
 test "lone dangling 0x80 is Incomplete; a >64-bit varint is InvalidMessage" {
@@ -505,7 +533,7 @@ test "lone dangling 0x80 is Incomplete; a >64-bit varint is InvalidMessage" {
     // A single 0x80 (continuation bit set, no terminating byte) ends inside a
     // varint: INCOMPLETE, not INVALID.
     var sink: Nothing = .{};
-    try testing.expectError(Error.Incomplete, decode(&.{0x80}, &sink));
+    try testing.expectEqual(Status.incomplete, try decode(&.{0x80}, &sink));
 
     // Eleven continuation bytes overflow any u64 varint: malformed regardless
     // of what follows, so INVALID.
@@ -556,6 +584,6 @@ test "decoder reuse via reset" {
     var is = IStream.init();
     try testing.expectError(Error.InvalidMessage, is.feed(&.{0x07}, &sink));
     is.reset();
-    try is.feed(buf[0..used], &sink);
-    try is.finish();
+    _ = try is.feed(buf[0..used], &sink);
+    try testing.expectEqual(Status.complete, is.status());
 }

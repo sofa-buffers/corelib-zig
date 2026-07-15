@@ -77,7 +77,7 @@ fn Decode(comptime message: *const []const u8) type {
         fn run(_: @This()) void {
             var sink: util.Checksum = .{};
             var is = sofab.IStream.init();
-            is.feed(message.*, &sink) catch unreachable;
+            _ = is.feed(message.*, &sink) catch unreachable;
             std.mem.doNotOptimizeAway(sink.acc);
         }
     };

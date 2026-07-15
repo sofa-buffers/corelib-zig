@@ -75,7 +75,7 @@ test "roundtrip: one-shot encode equals chunked encode, one-shot decode equals c
 
     // One-shot decode.
     var whole = common.Recorder.init(arena);
-    try sofab.decode(message, &whole);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(message, &whole));
 
     // Chunked decode at several odd chunk sizes, incl. one byte at a time.
     for ([_]usize{ 1, 3, 7, 13 }) |cs| {
@@ -83,9 +83,9 @@ test "roundtrip: one-shot encode equals chunked encode, one-shot decode equals c
         var is = sofab.IStream.init();
         var pos: usize = 0;
         while (pos < message.len) : (pos += cs) {
-            try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
+            _ = try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
         }
-        try is.finish();
+        try std.testing.expectEqual(sofab.Status.complete, is.status());
         try common.expectEventsEqual(whole.events.items, rec.events.items);
     }
 }
@@ -100,7 +100,7 @@ test "roundtrip: values survive bit-exactly" {
     try writeBigMessage(&os);
 
     var rec = common.Recorder.init(arena);
-    try sofab.decode(buf[0..os.bytesUsed()], &rec);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(buf[0..os.bytesUsed()], &rec));
     const ev = rec.events.items;
 
     // Spot-check boundary values recovered exactly.
@@ -131,7 +131,7 @@ test "NaN payloads round-trip bit-for-bit (not representable in the shared JSON)
     try os.writeFp64(1, @bitCast(nan_bits));
 
     var rec = common.Recorder.init(arena);
-    try sofab.decode(buf[0..os.bytesUsed()], &rec);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(buf[0..os.bytesUsed()], &rec));
     try common.expectEventsEqual(
         &.{.{ .fp64 = .{ .id = 1, .bits = nan_bits } }},
         rec.events.items,
