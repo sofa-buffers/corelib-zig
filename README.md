@@ -182,6 +182,29 @@ which raises this category before allocating. It is deliberately distinct from
 `error.InvalidMessage`: exceeding a receiver limit is policy, not wire
 malformation (see [`generator#102`](https://github.com/sofa-buffers/generator/issues/102)).
 
+### UTF-8 validation (`SOFAB_STRICT_UTF8`)
+
+A `string` payload is UTF-8; `blob` is opaque bytes and is never validated. Strict
+UTF-8 validation is gated by the compile-time build option `strict_utf8`
+(`SOFAB_STRICT_UTF8`, CORELIB_PLAN §6.4), **on by default**:
+
+```bash
+zig build test                       # strict on (default)
+zig build test -Dstrict_utf8=false   # non-strict build (validation compiled out)
+```
+
+Zig is a **byte-container** target (a string is `[]const u8`), so the corelib
+exposes the primitive `sofab.utf8_valid(bytes: []const u8) bool`. Generated
+decode code calls it **unconditionally** on every materialized `string`; the gate
+lives inside the primitive, so flipping the flag never regenerates code and
+generated code is identical across build configurations. On the encode side,
+`OStream.writeString` refuses a non-UTF-8 value with `error.InvalidArgument` under
+strict. `sofab.STRICT_UTF8` reflects the compiled state. When the option is off,
+`utf8_valid` folds to `true` (zero cost, no validator compiled in) and
+`writeString` writes bytes verbatim — never silent/lossy. Skipped fields are
+never validated. The validator is a real one (rejects overlong forms including
+`C0 80`, surrogates, and code points above `U+10FFFF`; accepts embedded `U+0000`).
+
 ### Code generator
 
 Usually you never touch the raw API: the
