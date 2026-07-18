@@ -7,6 +7,22 @@ pub fn build(b: *std.Build) void {
     // --release=fast`). A plain `zig build` stays Debug for development.
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
+    // SOFAB_STRICT_UTF8 (CORELIB_PLAN §6.4) — compile-time UTF-8 validation
+    // policy for `string` fields. This is a *validation policy, never a
+    // wire-format switch*: it only decides accept-vs-reject and never changes
+    // how valid data is encoded. ON (the default) validates on the encode side
+    // and makes `utf8_valid` a real validator; OFF folds `utf8_valid` to
+    // `return true` and drops the encode-side reject, so none of the validation
+    // code is compiled in (zero `.text`/`.rodata` cost) and generated code is
+    // identical across build configurations.
+    const strict_utf8 = b.option(
+        bool,
+        "strict_utf8",
+        "Enable strict UTF-8 validation of string fields (SOFAB_STRICT_UTF8, default on)",
+    ) orelse true;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "strict_utf8", strict_utf8);
+
     // The public module. Users depend on the package `sofa_buffers_corelib` and
     // import the namespace `sofab` (family convention, ARCHITECTURE §6).
     const sofab = b.addModule("sofab", .{
@@ -14,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    sofab.addOptions("build_options", build_options);
 
     // Static library artifact for non-Zig consumers of `zig build`.
     const lib = b.addLibrary(.{
@@ -60,11 +77,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
         });
-        mod.addImport("sofab", b.createModule(.{
+        const bench_sofab = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-        }));
+        });
+        bench_sofab.addOptions("build_options", build_options);
+        mod.addImport("sofab", bench_sofab);
         const exe = b.addExecutable(.{ .name = tool, .root_module = mod });
         b.installArtifact(exe);
         const run = b.addRunArtifact(exe);
@@ -85,11 +104,13 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .strip = false,
         });
-        mod.addImport("sofab", b.createModule(.{
+        const cg_sofab = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-        }));
+        });
+        cg_sofab.addOptions("build_options", build_options);
+        mod.addImport("sofab", cg_sofab);
         const exe = b.addExecutable(.{ .name = "callgrind", .root_module = mod });
         const install = b.addInstallArtifact(exe, .{});
         const step = b.step("callgrind", "Build the Callgrind instructions/op tool (run via bench/run_callgrind.sh)");

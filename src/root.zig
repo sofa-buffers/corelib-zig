@@ -59,9 +59,19 @@ pub const IStream = @import("istream.zig").IStream;
 pub const Status = @import("istream.zig").Status;
 pub const decode = @import("istream.zig").decode;
 
+/// UTF-8 validation primitive for `string` fields (CORELIB_PLAN §6.4). The
+/// generator emits an unconditional call to this on every materialized string;
+/// the strict/non-strict gate lives inside the primitive (`STRICT_UTF8`).
+pub const utf8_valid = @import("utf8.zig").utf8_valid;
+/// Compile-time state of `SOFAB_STRICT_UTF8` (Zig build option `strict_utf8`,
+/// default on). When off, `utf8_valid` folds to `true` and the encoder writes
+/// `string` bytes verbatim.
+pub const STRICT_UTF8 = @import("utf8.zig").STRICT_UTF8;
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("varint.zig");
     _ = @import("ostream.zig");
     _ = @import("istream.zig");
+    _ = @import("utf8.zig");
 }

@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const varint = @import("varint.zig");
+const utf8 = @import("utf8.zig");
 
 const native_endian = builtin.cpu.arch.endian();
 
@@ -199,8 +200,18 @@ pub const OStream = struct {
         try self.writeFixlen(id, &le, .fp64);
     }
 
-    /// Write a string field (raw UTF-8 bytes, no NUL on the wire).
+    /// Write a string field (UTF-8 bytes, no NUL on the wire).
+    ///
+    /// Under `SOFAB_STRICT_UTF8` (on by default, CORELIB_PLAN §6.4) a `string`
+    /// value that is not valid UTF-8 is refused with `error.InvalidArgument`:
+    /// encode-side validation enforces MESSAGE_SPEC §8's producer-side MUST NOT,
+    /// so a strict ecosystem's own encoders cannot emit bytes its decoders
+    /// reject. When the option is compiled off the check folds away and the
+    /// bytes are written verbatim.
     pub fn writeString(self: *OStream, id: Id, text: []const u8) Error!void {
+        if (comptime utf8.STRICT_UTF8) {
+            if (!utf8.utf8_valid(text)) return Error.InvalidArgument;
+        }
         try self.writeFixlen(id, text, .string);
     }
 
@@ -346,6 +357,23 @@ test "offset reserves framing space" {
     try os.writeUnsigned(0, 127);
     try testing.expectEqual(@as(usize, 4), os.bytesUsed());
     try testing.expectEqualSlices(u8, &.{ 0xAA, 0xAA, 0x00, 0x7F }, buf[0..4]);
+}
+
+test "writeString: UTF-8 policy follows SOFAB_STRICT_UTF8 (§6.4)" {
+    var buf: [16]u8 = undefined;
+    var os = OStream.init(&buf);
+    // A valid string is written unconditionally in both build configs.
+    try os.writeString(1, "ok\xC2\xA2"); // "ok" + U+00A2
+    if (comptime utf8.STRICT_UTF8) {
+        // Strict on (default): invalid UTF-8 (overlong NUL) is refused with
+        // InvalidArgument and writes nothing further.
+        const before = os.bytesUsed();
+        try testing.expectError(Error.InvalidArgument, os.writeString(2, &[_]u8{ 0xC0, 0x80 }));
+        try testing.expectEqual(before, os.bytesUsed());
+    } else {
+        // Strict off: bytes are written verbatim, no validation.
+        try os.writeString(2, &[_]u8{ 0xC0, 0x80 });
+    }
 }
 
 test "sequence depth is capped at MAX_DEPTH on the encoder" {
