@@ -275,6 +275,15 @@ This is a **push / visitor** model, so there is no address-stability requirement
 on decoded values. The only memory the decoder owns is `IStream`'s fixed 64-byte
 carry buffer — the few bytes of an item that straddled a chunk boundary.
 
+## Feature flags
+
+The wire format is always fully supported — there are no toggles for wire types.
+The one build option is the strict UTF-8 validation policy:
+
+| Build option | Default | Effect |
+|--------------|---------|--------|
+| `-Dstrict_utf8=<bool>` (`SOFAB_STRICT_UTF8`) | `true` (on) | Strict UTF-8 validation of `string` fields — see [UTF-8 validation](#utf-8-validation-sofab_strict_utf8). Off compiles the validator out (zero cost) and stores/writes bytes verbatim. A validation policy only, never a wire-format switch. |
+
 ## Build & test
 
 ```bash
