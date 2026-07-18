@@ -44,7 +44,23 @@ pub fn utf8_valid(bytes: []const u8) bool {
     // std.unicode.utf8ValidateSlice is a real DFA-style validator: it rejects
     // overlong forms, surrogates and > U+10FFFF, and accepts embedded NUL —
     // exactly the CORELIB_PLAN §6.4 requirements (asserted by the tests below).
-    return std.unicode.utf8ValidateSlice(bytes);
+    //
+    // Its own ASCII fast path is a SIMD loop gated on
+    // `remaining.len >= std.simd.suggestVectorLength(u8)` — 32 bytes on x86-64
+    // with AVX2. Protocol strings are typically far shorter than that, so for
+    // most payloads that loop never runs a single iteration and validation
+    // degrades to the byte-wise table walk. Skip whole ASCII words first, at a
+    // granularity short strings actually reach, then hand over the remainder.
+    //
+    // Splitting here is sound: an ASCII byte is always a complete codepoint, so
+    // a prefix of ASCII can never carry decoder state into the rest of the slice.
+    var i: usize = 0;
+    while (i + 8 <= bytes.len) {
+        const w: u64 = @bitCast(bytes[i..][0..8].*);
+        if (w & 0x8080808080808080 != 0) break;
+        i += 8;
+    }
+    return std.unicode.utf8ValidateSlice(bytes[i..]);
 }
 
 // --- unit tests -----------------------------------------------------------------
