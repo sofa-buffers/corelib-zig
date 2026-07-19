@@ -73,10 +73,12 @@ test "truncated inputs are Incomplete, not rejected" {
 
 test "overlong and overflowing varints are rejected" {
     // Field header: 12 continuation bytes exceed any u64 varint.
-    try expectInvalidWholeAndChunked(&[_]u8{0xFF} ** 12);
+    const header_overflow: [12]u8 = @splat(0xFF);
+    try expectInvalidWholeAndChunked(&header_overflow);
 
     // Value varint of field id 0 (header 0x00) that overflows 64 bits.
-    try expectInvalidWholeAndChunked(&[_]u8{0x00} ++ [_]u8{0xFF} ** 9 ++ [_]u8{0x7F});
+    const nine_continuations: [9]u8 = @splat(0xFF);
+    try expectInvalidWholeAndChunked(&[_]u8{0x00} ++ nine_continuations ++ [_]u8{0x7F});
 }
 
 test "unbalanced sequence framing is rejected" {
@@ -93,7 +95,7 @@ test "an unclosed sequence is Incomplete, not rejected" {
 }
 
 test "nesting past MAX_DEPTH is rejected" {
-    const bytes = [_]u8{0x0E} ** 256; // 256 nested sequence starts
+    const bytes: [256]u8 = @splat(0x0E); // 256 nested sequence starts
     try expectInvalidWholeAndChunked(&bytes);
 }
 
@@ -146,7 +148,8 @@ test "decoder survives malformed input after valid fields (resync check)" {
 
     var bad: std.ArrayList(u8) = .empty;
     bad.appendSlice(arena, good) catch @panic("oom");
-    bad.appendSlice(arena, &[_]u8{0xFF} ** 12) catch @panic("oom");
+    const trailing_overflow: [12]u8 = @splat(0xFF);
+    bad.appendSlice(arena, &trailing_overflow) catch @panic("oom");
 
     var rec = common.Recorder.init(arena);
     var is = sofab.IStream.init();
