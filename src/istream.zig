@@ -538,7 +538,8 @@ test "lone dangling 0x80 is Incomplete; a >64-bit varint is InvalidMessage" {
     // Eleven continuation bytes overflow any u64 varint: malformed regardless
     // of what follows, so INVALID.
     var sink2: Nothing = .{};
-    try testing.expectError(Error.InvalidMessage, decode(&([_]u8{0x80} ** 11), &sink2));
+    const all_continuation: [11]u8 = @splat(0x80);
+    try testing.expectError(Error.InvalidMessage, decode(&all_continuation, &sink2));
 }
 
 test "dangling sequence end is rejected" {
