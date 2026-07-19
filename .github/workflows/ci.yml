@@ -23,21 +23,29 @@ jobs:
 
   # Build + full test suite (incl. the shared vectors from assets/) in both
   # optimize modes: Debug keeps all safety checks; ReleaseFast is the shipping
-  # config this port is tuned for. Zig has a single upstream toolchain and the
-  # library tracks one pinned version (no_std-style version matrices don't
-  # apply), so a single pinned leg is used per ARCHITECTURE §12.1.
+  # config this port is tuned for.
+  #
+  # Zig has a single upstream toolchain and `build.zig.zon` declares
+  # `minimum_zig_version = 0.16.0`, so there is no older-stable leg to test
+  # against — pre-0.16 compilers are rejected by the package manager, not
+  # merely untested. The matrix is therefore "the pinned stable we ship
+  # against" plus a non-blocking `master` leg that gives early warning when a
+  # 0.17-dev change breaks us, without turning upstream churn into a red PR.
   test:
-    name: Test (${{ matrix.mode }})
+    name: Test (${{ matrix.mode }}, zig ${{ matrix.zig }})
     runs-on: ubuntu-latest
+    # `master` moves under us; its failures are informational only.
+    continue-on-error: ${{ matrix.zig == 'master' }}
     strategy:
       fail-fast: false
       matrix:
         mode: [debug, release]
+        zig: [0.16.0, master]
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
-          version: ${{ env.ZIG_VERSION }}
+          version: ${{ matrix.zig }}
       - name: Build
         run: zig build ${{ matrix.mode == 'release' && '--release=fast' || '' }}
       - name: Test
@@ -65,6 +73,28 @@ jobs:
           # `qemu-s390x-static`.
           sudo ln -sf /usr/bin/qemu-s390x-static /usr/local/bin/qemu-s390x
       - run: zig build test -Dtarget=s390x-linux -fqemu
+
+  # Same suite on a 32-bit target, pinning down the places where the port would
+  # otherwise silently assume a 64-bit `usize`: length/offset arithmetic, varint
+  # decode into `usize`, and any capacity bound that only overflows when
+  # `usize` is 32 bits wide. x86-linux binaries execute directly on the 64-bit
+  # runner (freestanding static Zig binaries need no 32-bit userland), so this
+  # leg needs no QEMU and runs at full speed. Both optimize modes are covered:
+  # Debug catches the overflow via safety checks, ReleaseFast proves the
+  # shipping config still round-trips.
+  test-32bit:
+    name: Test (32-bit, x86)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [debug, release]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test -Dtarget=x86-linux ${{ matrix.mode == 'release' && '--release=fast' || '' }}
 
   # Line coverage via kcov over the test binaries; publishes the README's
   # coverage badge from main.
