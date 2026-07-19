@@ -25,27 +25,26 @@ jobs:
   # optimize modes: Debug keeps all safety checks; ReleaseFast is the shipping
   # config this port is tuned for.
   #
-  # Zig has a single upstream toolchain and `build.zig.zon` declares
-  # `minimum_zig_version = 0.16.0`, so there is no older-stable leg to test
-  # against — pre-0.16 compilers are rejected by the package manager, not
-  # merely untested. The matrix is therefore "the pinned stable we ship
-  # against" plus a non-blocking `master` leg that gives early warning when a
-  # 0.17-dev change breaks us, without turning upstream churn into a red PR.
+  # A single pinned toolchain, deliberately. `build.zig.zon` declares
+  # `minimum_zig_version = 0.16.0` and 0.16.0 is the current stable, so there
+  # is no older-stable leg to add — pre-0.16 compilers are rejected by the
+  # package manager, not merely untested. A `master` (0.17-dev) leg is left
+  # out on purpose too: CI exists to test this implementation, not to track
+  # upstream's development branch, and a nightly that moves under us produces
+  # red checks nobody can act on. The 0.17 migration is handled when 0.17
+  # ships.
   test:
-    name: Test (zig ${{ matrix.zig }}, ${{ matrix.mode }})
+    name: Test (x86_64, ${{ matrix.mode }})
     runs-on: ubuntu-latest
-    # `master` moves under us; its failures are informational only.
-    continue-on-error: ${{ matrix.zig == 'master' }}
     strategy:
       fail-fast: false
       matrix:
         mode: [debug, release]
-        zig: [0.16.0, master]
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
-          version: ${{ matrix.zig }}
+          version: ${{ env.ZIG_VERSION }}
       - name: Build
         run: zig build ${{ matrix.mode == 'release' && '--release=fast' || '' }}
       - name: Test
