@@ -32,7 +32,7 @@ jobs:
   # against" plus a non-blocking `master` leg that gives early warning when a
   # 0.17-dev change breaks us, without turning upstream churn into a red PR.
   test:
-    name: Test (${{ matrix.mode }}, zig ${{ matrix.zig }})
+    name: Test (zig ${{ matrix.zig }}, ${{ matrix.mode }})
     runs-on: ubuntu-latest
     # `master` moves under us; its failures are informational only.
     continue-on-error: ${{ matrix.zig == 'master' }}
@@ -59,7 +59,7 @@ jobs:
   # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
   # little-endian wire format round-trips correctly off little-endian hardware.
   test-big-endian:
-    name: Test (big-endian, s390x)
+    name: Test (s390x big-endian)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -83,7 +83,7 @@ jobs:
   # Debug catches the overflow via safety checks, ReleaseFast proves the
   # shipping config still round-trips.
   test-32bit:
-    name: Test (32-bit, x86)
+    name: Test (x86 32-bit, ${{ matrix.mode }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
