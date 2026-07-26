@@ -17,9 +17,12 @@ test "normative limits (§6.2)" {
 
 test "error baseline (§6.3) is exposed" {
     // The canonical baseline codes must all be members of the error set.
+    // UsageError is deliberately absent: it was declared and never returned, so
+    // it left callers a branch that could not be reached (the C corelib removed
+    // its SOFAB_RET_E_USAGE for the same reason). A caller error here is an
+    // InvalidArgument.
     const E = sofab.Error;
     try std.testing.expectError(E.InvalidArgument, @as(E!void, E.InvalidArgument));
-    try std.testing.expectError(E.UsageError, @as(E!void, E.UsageError));
     try std.testing.expectError(E.BufferFull, @as(E!void, E.BufferFull));
     try std.testing.expectError(E.InvalidMessage, @as(E!void, E.InvalidMessage));
     // LIMIT_EXCEEDED is a distinct policy outcome (generator#102), exposed for
