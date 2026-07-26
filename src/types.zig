@@ -39,10 +39,6 @@ pub const Error = error{
     /// sequences). Corresponds to `SOFAB_RET_E_ARGUMENT`.
     InvalidArgument,
 
-    /// Invalid API usage (e.g. a decoded value does not fit the requested
-    /// type). Corresponds to `SOFAB_RET_E_USAGE`.
-    UsageError,
-
     /// The output buffer is full and no flush sink is available.
     /// Corresponds to `SOFAB_RET_E_BUFFER_FULL`.
     BufferFull,
