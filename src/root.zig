@@ -68,10 +68,17 @@ pub const utf8_valid = @import("utf8.zig").utf8_valid;
 /// `string` bytes verbatim.
 pub const STRICT_UTF8 = @import("utf8.zig").STRICT_UTF8;
 
+/// Array helpers the generated encode/decode paths need for every array field
+/// (trailing-default trim/refill, bounded element stores, wrapper-array
+/// placement). They carry no schema knowledge — the count, the element default
+/// and the allocator are passed in.
+pub const arrays = @import("arrays.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("varint.zig");
     _ = @import("ostream.zig");
     _ = @import("istream.zig");
+    _ = @import("arrays.zig");
     _ = @import("utf8.zig");
 }
