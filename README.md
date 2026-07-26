@@ -89,6 +89,35 @@ try os.writeString(3, "hi");
 const message = buf[0..os.bytesUsed()];
 ```
 
+Nested scopes are opened with `writeSequenceBeginLazy(id)`, which **holds the
+header back** until the sequence turns out to have content — that is what lets
+the message layer omit an all-default sequence without ever buffering the
+sub-message (MESSAGE_SPEC §2, CORELIB_PLAN §6). Which closer you use is a
+property of the *position*, decided at generation time, not of the value:
+
+```zig
+try os.writeSequenceBeginLazy(4);
+try os.writeUnsigned(1, 99);
+try os.writeSequenceEnd(); // struct/union field, or an array field:
+                           // a sequence that got no content vanishes entirely
+```
+
+| position | closer |
+|---|---|
+| `struct` / `union` field | `writeSequenceEnd` |
+| array field (the wrapper) | `writeSequenceEnd` |
+| wrapper-array **element** (`struct`/`union`/nested row) | `writeSequenceEndKeep` |
+| array field known to differ from a **non-empty** declared `default` | `writeSequenceEndKeep` |
+
+`writeSequenceEndKeep` behaves like a write: it emits the held-back headers and
+the end marker, so a contentless sequence still reaches the wire as
+`begin` + `end`. It is the safe default when a call site is ambiguous — using it
+where `writeSequenceEnd` would do costs one non-canonical empty frame that every
+decoder normalizes away, while the reverse drops an array element and silently
+changes the decoded array's **length** (MESSAGE_SPEC §5.1). Held-back ids are
+encoder state, never buffer content, so a flush can never split a pending run:
+a tiny output buffer produces exactly the one-shot bytes.
+
 ### Serialize stream
 
 Attach a flush callback with `OStream.initFlush`. When the scratch buffer

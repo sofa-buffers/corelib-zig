@@ -23,15 +23,22 @@ fn writeBigMessage(os: *sofab.OStream) !void {
     try os.writeArraySigned(11, &[_]i64{ 0, -1, 1, -300, 1 << 60, -(1 << 60) });
     try os.writeArrayFp32(12, &[_]f32{ 0.0, -0.0, std.math.inf(f32), -std.math.inf(f32) });
     try os.writeArrayFp64(13, &[_]f64{ 1.5, -1.5, std.math.inf(f64) });
-    try os.writeSequenceBegin(14);
+    try os.writeSequenceBeginLazy(14);
     {
         try os.writeUnsigned(1, 99);
         try os.writeString(2, "nested");
-        try os.writeSequenceBegin(3);
+        try os.writeSequenceBeginLazy(3);
         {
             try os.writeSigned(1, -7);
-            try os.writeSequenceBegin(1); // empty innermost sequence
-            try os.writeSequenceEnd();
+            // Empty innermost sequence, closed with `writeSequenceEndKeep` so
+            // the empty frame still reaches the wire — the wrapper-array
+            // *element* position (MESSAGE_SPEC §5.1), the one place a
+            // contentless sequence must stay visible. In the *field* position
+            // `writeSequenceEnd` would drop it instead (covered by the ostream
+            // unit tests); keeping it here preserves this suite's coverage of
+            // the empty-sequence wire form through the decoder.
+            try os.writeSequenceBeginLazy(1);
+            try os.writeSequenceEndKeep();
         }
         try os.writeSequenceEnd();
     }

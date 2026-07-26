@@ -102,9 +102,17 @@ fn writeFields(os: *sofab.OStream, arena: std.mem.Allocator, fields: []const std
         } else if (std.mem.eql(u8, op, "array")) {
             try writeArray(os, arena, id, f);
         } else if (std.mem.eql(u8, op, "sequence_begin")) {
-            try os.writeSequenceBegin(id);
+            try os.writeSequenceBeginLazy(id);
         } else if (std.mem.eql(u8, op, "sequence_end")) {
-            try os.writeSequenceEnd();
+            // The vectors' op list is replayed against the **dense**
+            // `serialized` hex, which always carries the frame — including the
+            // three empty-sequence vectors. So the replay closes with
+            // `writeSequenceEndKeep`: `writeSequenceEnd` would drop a
+            // contentless frame and those vectors would encode to nothing.
+            // (The sparse-canonical form, where the field-position frame *is*
+            // dropped, is the `serialized_sparse` hex — a generated-code
+            // concern, not a raw-encoder replay one.)
+            try os.writeSequenceEndKeep();
         } else {
             @panic("unsupported op in vectors");
         }

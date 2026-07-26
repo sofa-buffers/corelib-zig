@@ -55,7 +55,7 @@ test "truncated inputs are Incomplete, not rejected" {
     // in a sequence makes every strict prefix detectably incomplete.)
     var buf: [64]u8 = undefined;
     var os = sofab.OStream.init(&buf);
-    try os.writeSequenceBegin(1);
+    try os.writeSequenceBeginLazy(1);
     try os.writeUnsigned(1, 300);
     try os.writeString(2, "hello");
     try os.writeSequenceEnd();
