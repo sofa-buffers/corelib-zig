@@ -31,6 +31,21 @@ const Event = common.Event;
 const Id = sofab.Id;
 
 /// The shared vectors, embedded verbatim from the asset copy.
+///
+/// **Which column this suite asserts:** `serialized.hex` — the dense,
+/// primitive-layer ground truth, where every sequence in the op list carries its
+/// frame. That is the only column a corelib *can* assert: this repo has no
+/// message layer, so it has no schema, no declared defaults and therefore no way
+/// to decide that a sequence field equals its default.
+///
+/// The sibling `serialized_sparse.hex` column — the same message with an
+/// all-default sequence *field* omitted (MESSAGE_SPEC §2) — is deliberately
+/// **not** read here. It is produced and checked one layer up, by the
+/// generator's per-language conformance drivers
+/// (`tests/conformance/zig/check_vectors.py` in sofa-buffers/generator), which
+/// own the schema that says what "default" means. What this corelib owes that
+/// layer is the `writeSequenceEnd` / `writeSequenceEndKeep` pair those drivers
+/// build on, covered by the lazy-framing unit tests in `src/ostream.zig`.
 const vectors_json = @embedFile("test_vectors");
 
 // --- JSON helpers -------------------------------------------------------------

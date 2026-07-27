@@ -29,14 +29,6 @@ const FixlenType = types.FixlenType;
 /// registered alongside the callback (e.g. a transport or an output list).
 pub const FlushFn = *const fn (ctx: ?*anyopaque, data: []const u8) void;
 
-/// How many nested sequence headers can be held back at once (see
-/// `OStream.writeSequenceBeginLazy`). A run deeper than this is framed eagerly:
-/// still valid, just not canonical — an all-default sequence nested deeper than
-/// this keeps its empty frame, which a decoder accepts and normalizes away
-/// (MESSAGE_SPEC §2). Sized for real schemas rather than the format's
-/// `MAX_DEPTH` ceiling so the encoder stays small.
-pub const LAZY_SEQ_DEPTH: usize = 32;
-
 /// Streaming Sofab encoder writing into a caller-provided buffer.
 pub const OStream = struct {
     buffer: []u8,
@@ -47,7 +39,19 @@ pub const OStream = struct {
     /// yet (MESSAGE_SPEC §2 lazy framing). Always a contiguous suffix of the
     /// open sequences: writing any field commits the whole run at once, so
     /// `writeSequenceEnd` can drop the innermost by popping the last entry.
-    pending: [LAZY_SEQ_DEPTH]Id = undefined,
+    ///
+    /// The hold-back reaches the **full `MAX_DEPTH`** (CORELIB_PLAN §6, "How
+    /// deep the hold-back reaches"), so this encoder is canonical at every
+    /// depth the format allows: there is no window past which it falls back to
+    /// eager framing and emits the empty frame §2 omits. Only a heap-free
+    /// profile may bound the run, and any bound has to be documented — two
+    /// encoders that disagree about it disagree about *bytes*. This port keeps
+    /// its allocation-free contract instead and reserves the run inline,
+    /// `MAX_DEPTH` entries, which is why an `OStream` is a kilobyte-sized value
+    /// (1072 bytes on a 64-bit target). `depth` is checked against `MAX_DEPTH`
+    /// before a push and `npending <= depth` always holds, so the array cannot
+    /// overflow.
+    pending: [types.MAX_DEPTH]Id = undefined,
     /// Number of valid entries in `pending`.
     npending: usize = 0,
     /// `null` means "no sink": a full buffer is an error rather than a flush.
@@ -185,14 +189,33 @@ pub const OStream = struct {
 
     /// Write out the held-back sequence headers, outermost first.
     ///
-    /// Cold: it runs at most once per non-default sequence, never per field.
-    fn commitPending(self: *OStream) Error!void {
+    /// Cold and `noinline`: it runs at most once per non-default sequence,
+    /// never per field, and keeping it out of line keeps the `writeIdType`
+    /// choke point — which every single field write inlines — small.
+    ///
+    /// An entry is dropped from the run only once its header is on its way out,
+    /// so a `BufferFull` partway through leaves `pending` describing exactly the
+    /// sequences that are still open *and* still unframed. Zeroing `npending`
+    /// up front instead would lose the rest of the run: a caller that recovers
+    /// (`bufferSet` with a fresh buffer) would then emit end markers for
+    /// sequences whose headers were never written — a structurally broken
+    /// message rather than a truncated one.
+    noinline fn commitPending(self: *OStream) Error!void {
         @branchHint(.cold);
         const n = self.npending;
-        self.npending = 0;
-        for (self.pending[0..n]) |id| {
-            try self.writeVarint((@as(Unsigned, id) << 3) | types.T_SEQUENCE_START);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            self.writeVarint((@as(Unsigned, self.pending[i]) << 3) | types.T_SEQUENCE_START) catch |err| {
+                // Keep the unwritten suffix — including the entry that failed,
+                // whose header may have made it out only in part — as the new
+                // pending run, still a contiguous suffix of the open sequences.
+                const rest = n - i;
+                std.mem.copyForwards(Id, self.pending[0..rest], self.pending[i..n]);
+                self.npending = rest;
+                return err;
+            };
         }
+        self.npending = 0;
     }
 
     // --- scalar writers -----------------------------------------------------
@@ -357,22 +380,20 @@ pub const OStream = struct {
     /// contentless one survives: `writeSequenceEnd` drops it,
     /// `writeSequenceEndKeep` forces the frame out.
     ///
+    /// The hold-back is **unbounded up to `MAX_DEPTH`** (CORELIB_PLAN §6): a
+    /// sequence nested 255 deep and closed contentless still emits nothing, so
+    /// the bytes are canonical at every depth the format permits.
+    ///
     /// Returns `error.InvalidArgument` if more than `MAX_DEPTH` (255) sequences
     /// would be open at once (§4.9), or for an `id` above `ID_MAX`.
     pub fn writeSequenceBeginLazy(self: *OStream, id: Id) Error!void {
         if (self.depth >= types.MAX_DEPTH) return Error.InvalidArgument;
         if (id > types.ID_MAX) return Error.InvalidArgument;
-        if (self.npending < LAZY_SEQ_DEPTH) {
-            self.pending[self.npending] = id;
-            self.npending += 1;
-        } else {
-            // Deeper than the hold-back window: commit the run and frame
-            // eagerly, which keeps the "pending is a contiguous suffix of the
-            // open sequences" invariant `writeSequenceEnd` relies on. Valid,
-            // just not canonical if this sequence turns out to be all-default.
-            try self.commitPending();
-            try self.writeVarint((@as(Unsigned, id) << 3) | types.T_SEQUENCE_START);
-        }
+        // `pending` holds `MAX_DEPTH` entries and the depth check above ran
+        // first, so there is always room: the hold-back reaches every depth the
+        // format allows and never falls back to eager framing.
+        self.pending[self.npending] = id;
+        self.npending += 1;
         self.depth += 1;
     }
 
@@ -488,7 +509,7 @@ test "sequence depth is capped at MAX_DEPTH on the encoder" {
     while (i < types.MAX_DEPTH) : (i += 1) try os.writeSequenceBeginLazy(1);
     try testing.expectError(Error.InvalidArgument, os.writeSequenceBeginLazy(1));
     // After closing one, opening one more is allowed again: both closers
-    // decrement the depth exactly like the eager pair did.
+    // decrement the depth, whether or not the frame reaches the wire.
     try os.writeSequenceEnd();
     try os.writeSequenceBeginLazy(1);
 }
@@ -504,7 +525,8 @@ fn encoded(buf: []u8, body: anytype) Error![]const u8 {
 
 test "lazy sequence without content emits nothing" {
     // An all-default sequence carries no information, so the field is omitted —
-    // where the eager API would have written the two-byte empty frame `0E 07`.
+    // where the pre-§2 rule ("a sequence field is always framed") put the
+    // two-byte empty frame `0E 07`.
     var buf: [16]u8 = undefined;
     const bytes = try encoded(&buf, struct {
         fn f(os: *OStream) Error!void {
@@ -614,10 +636,19 @@ test "lazy sequence after content is independent" {
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x01, 0x10, 0x03 }, bytes);
 }
 
-test "lazy framing is buffer-size independent" {
-    // Held-back headers are encoder state, not buffer content, so a flush can
-    // never split a pending run: a 3-byte output buffer sees exactly the
-    // one-shot bytes (CORELIB_PLAN §6).
+test "a run committed across flushes is byte-identical to the one-shot encode" {
+    // What this proves: the same op sequence encoded through a 3-byte flush
+    // buffer — so the committed run's own bytes straddle two flushes — yields
+    // exactly the bytes of a one-shot encode into a buffer that holds the whole
+    // message (CORELIB_PLAN §6).
+    //
+    // What it deliberately does NOT claim to exercise is a flush landing *while*
+    // a header is still held back: that is unreachable by construction, not
+    // merely untested. A held-back header occupies no buffer space (the ids are
+    // encoder state, never buffer content), and the buffer can only fill through
+    // a write — which passes `writeIdType` and therefore commits the run before
+    // its first byte. So there is no state in which a pending run is open and a
+    // flush occurs, and no test can construct one.
     const Sink = struct {
         out: [64]u8 = undefined,
         len: usize = 0,
@@ -627,16 +658,34 @@ test "lazy framing is buffer-size independent" {
             self.len += data.len;
         }
     };
+    // Three nested lazy opens: the committed run is three header bytes, so
+    // through a 3-byte buffer it fills the buffer exactly and everything after
+    // it lands in later flushes.
+    const ops = struct {
+        fn f(os: *OStream) Error!void {
+            try os.writeSequenceBeginLazy(1);
+            try os.writeSequenceBeginLazy(2);
+            try os.writeSequenceBeginLazy(3);
+            try os.writeSequenceBeginLazy(4);
+            try os.writeSequenceEnd(); // contentless: dropped either way
+            try os.writeUnsigned(0, 42); // commits the run of three
+            try os.writeSequenceEnd();
+            try os.writeSequenceEnd();
+            try os.writeSequenceEnd();
+        }
+    }.f;
+
+    var one_shot_buf: [32]u8 = undefined;
+    const one_shot = try encoded(&one_shot_buf, ops);
+
     var sink: Sink = .{};
     var tiny: [3]u8 = undefined;
     var os = OStream.initFlush(&tiny, 0, &sink, Sink.push);
-    try os.writeSequenceBeginLazy(1);
-    try os.writeSequenceBeginLazy(2);
-    try os.writeSequenceEnd();
-    try os.writeUnsigned(0, 42);
-    try os.writeSequenceEnd();
+    try ops(&os);
     _ = os.flush();
-    try testing.expectEqualSlices(u8, &.{ 0x0E, 0x00, 0x2A, 0x07 }, sink.out[0..sink.len]);
+
+    try testing.expectEqualSlices(u8, &.{ 0x0E, 0x16, 0x1E, 0x00, 0x2A, 0x07, 0x07, 0x07 }, one_shot);
+    try testing.expectEqualSlices(u8, one_shot, sink.out[0..sink.len]);
 }
 
 test "every writer commits the pending run before its first byte" {
@@ -721,27 +770,60 @@ test "every writer commits the pending run before its first byte" {
     }
 }
 
-test "the hold-back window falls back to eager framing without losing a frame" {
-    // Past LAZY_SEQ_DEPTH the run is committed and the header written eagerly.
-    // The invariant that matters is that `writeSequenceEnd` still closes the
-    // *innermost* sequence: opening one more than the window and closing them
-    // all must yield a balanced, decodable frame.
-    var buf: [256]u8 = undefined;
+test "deep nesting closed contentless still emits nothing" {
+    // The hold-back has no window (CORELIB_PLAN §6, "How deep the hold-back
+    // reaches"): 40 levels — deeper than any bounded run this port ever had —
+    // opened and closed without a single field write must produce ZERO bytes.
+    // A bounded run would have framed the levels past its bound eagerly and
+    // emitted their empty frames here, which is exactly the non-canonical
+    // output §2 no longer wants from an implementation that need not bound.
+    var buf: [512]u8 = undefined;
     var os = OStream.init(&buf);
     var i: usize = 0;
-    while (i <= LAZY_SEQ_DEPTH) : (i += 1) try os.writeSequenceBeginLazy(1);
+    while (i < 40) : (i += 1) try os.writeSequenceBeginLazy(@intCast(i + 1));
+    try testing.expectEqual(@as(usize, 40), os.npending);
+    i = 0;
+    while (i < 40) : (i += 1) try os.writeSequenceEnd();
+    try testing.expectEqual(@as(usize, 0), os.npending);
+    try testing.expectEqual(@as(u32, 0), os.depth);
+    try testing.expectEqualSlices(u8, &.{}, buf[0..os.bytesUsed()]);
+}
+
+test "the hold-back run reaches the full MAX_DEPTH" {
+    // At the format's ceiling the run still holds every header, and one field
+    // at the bottom commits all 255 of them in outermost-first order.
+    var buf: [1024]u8 = undefined;
+    var os = OStream.init(&buf);
+    var i: usize = 0;
+    while (i < types.MAX_DEPTH) : (i += 1) try os.writeSequenceBeginLazy(1);
+    try testing.expectEqual(@as(usize, types.MAX_DEPTH), os.npending);
     try os.writeUnsigned(0, 7); // content: every enclosing frame is committed
     i = 0;
-    while (i <= LAZY_SEQ_DEPTH) : (i += 1) try os.writeSequenceEnd();
+    while (i < types.MAX_DEPTH) : (i += 1) try os.writeSequenceEnd();
     const bytes = buf[0..os.bytesUsed()];
     try testing.expectEqual(@as(usize, 0), os.npending);
     try testing.expectEqual(@as(u32, 0), os.depth);
-    // (LAZY_SEQ_DEPTH + 1) begin headers (0x0E) + `00 07` + the same number of
-    // 0x07 end markers.
-    try testing.expectEqual(2 * (LAZY_SEQ_DEPTH + 1) + 2, bytes.len);
-    for (bytes[0 .. LAZY_SEQ_DEPTH + 1]) |b| try testing.expectEqual(@as(u8, 0x0E), b);
-    try testing.expectEqualSlices(u8, &.{ 0x00, 0x07 }, bytes[LAZY_SEQ_DEPTH + 1 ..][0..2]);
-    for (bytes[LAZY_SEQ_DEPTH + 3 ..]) |b| try testing.expectEqual(@as(u8, 0x07), b);
+    // MAX_DEPTH begin headers (0x0E) + `00 07` + MAX_DEPTH end markers.
+    try testing.expectEqual(2 * types.MAX_DEPTH + 2, bytes.len);
+    for (bytes[0..types.MAX_DEPTH]) |b| try testing.expectEqual(@as(u8, 0x0E), b);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x07 }, bytes[types.MAX_DEPTH..][0..2]);
+    for (bytes[types.MAX_DEPTH + 2 ..]) |b| try testing.expectEqual(@as(u8, 0x07), b);
+}
+
+test "a failed commit keeps the rest of the run pending" {
+    // `commitPending` drops an entry only once its header is on its way out.
+    // A 1-byte buffer with no sink fails on the second header; the two
+    // sequences whose headers never made it must still be pending, so a
+    // recovering caller frames them rather than emitting orphaned end markers.
+    var buf: [1]u8 = undefined;
+    var os = OStream.init(&buf);
+    try os.writeSequenceBeginLazy(1);
+    try os.writeSequenceBeginLazy(2);
+    try os.writeSequenceBeginLazy(3);
+    try testing.expectError(Error.BufferFull, os.writeUnsigned(0, 1));
+    try testing.expectEqual(@as(usize, 2), os.npending);
+    try testing.expectEqual(@as(Id, 2), os.pending[0]);
+    try testing.expectEqual(@as(Id, 3), os.pending[1]);
 }
 
 test "flush drains pending bytes and mid-stream buffer swap works" {

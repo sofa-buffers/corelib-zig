@@ -54,9 +54,6 @@ pub const ArrayKind = types.ArrayKind;
 
 pub const OStream = @import("ostream.zig").OStream;
 pub const FlushFn = @import("ostream.zig").FlushFn;
-/// Depth of the encoder's lazy-sequence hold-back window
-/// (`OStream.writeSequenceBeginLazy`, MESSAGE_SPEC §2).
-pub const LAZY_SEQ_DEPTH = @import("ostream.zig").LAZY_SEQ_DEPTH;
 
 pub const IStream = @import("istream.zig").IStream;
 pub const Status = @import("istream.zig").Status;
