@@ -18,10 +18,13 @@
 A **maximum-throughput, streaming** Zig implementation of the SofaBuffers
 (*Sofab*) serialization format. The decoder advances a Protocol-Buffers-style
 cursor over contiguous memory with zero copies, field dispatch is comptime duck
-typing (monomorphized, no vtable), and the entire library — encoder *and*
-decoder — is **allocation-free**: caller-owned buffers on both sides, a fixed
-carry buffer inside the streaming decoder, no allocator anywhere. It is
-wire-compatible, byte-for-byte, with every other `corelib-*` port.
+typing (monomorphized, no vtable), and the codec itself — `OStream` *and*
+`IStream`/`decode` — is **allocation-free**: caller-owned buffers on both sides,
+a fixed carry buffer inside the streaming decoder, no allocator held or taken.
+(The `sofab.arrays` helpers that generated *decode* code uses for dynamically
+sized arrays are the one exception: they take the caller's allocator as an
+argument.) It is wire-compatible, byte-for-byte, with every other `corelib-*`
+port.
 
 ### Requirements
 
@@ -60,7 +63,7 @@ suite. Nothing is pulled into downstream builds.
 | Streaming **out** | `OStream` writes into a caller buffer and calls a flush callback when it fills, so a message can exceed the buffer; `bufferSet` swaps the buffer mid-stream. |
 | Streaming **in** | `IStream.feed` takes arbitrarily small chunks and suspends/resumes at any byte boundary; string/blob payloads are delivered incrementally. |
 | Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only the few bytes of a small item that straddles a chunk boundary. |
-| No allocation | The whole library is allocator-free — not just the hot path. Encoder state is a struct over your buffer; the decoder's only memory is a fixed 64-byte carry buffer. |
+| No allocation | The codec is allocator-free — not just the hot path. Encoder state is a struct over your buffer (plus the inline sequence hold-back run, see below); the decoder's only memory is a fixed 64-byte carry buffer. Only the `sofab.arrays` helpers for dynamically sized arrays take an allocator, and only as a parameter. |
 | Raw speed | Unchecked pointer-advancing varint encode *and* decode once bounds are guaranteed, bulk `@memcpy`/native little-endian float loads, comptime-monomorphized visitor dispatch, `@branchHint(.cold)` on the drain path, ReleaseFast shipping profile. |
 | Type safety | Wire types and value widths live in the type system; array element widths are comptime-checked, so an invalid element type is a compile error. |
 | Cross-language compatibility | The shared `assets/test_vectors.json` is replayed — the same bytes every other port produces — plus a big-endian (s390x) CI leg. |
@@ -88,6 +91,49 @@ try os.writeSigned(2, -7);
 try os.writeString(3, "hi");
 const message = buf[0..os.bytesUsed()];
 ```
+
+Nested scopes are opened with `writeSequenceBeginLazy(id)`, which **holds the
+header back** until the sequence turns out to have content — that is what lets
+the message layer omit an all-default sequence without ever buffering the
+sub-message (MESSAGE_SPEC §2, CORELIB_PLAN §6). Which closer you use is a
+property of the *position*, decided at generation time, not of the value:
+
+```zig
+try os.writeSequenceBeginLazy(4);
+try os.writeUnsigned(1, 99);
+try os.writeSequenceEnd(); // struct/union field, or an array field:
+                           // a sequence that got no content vanishes entirely
+```
+
+| position | closer |
+|---|---|
+| `struct` / `union` field | `writeSequenceEnd` |
+| array field (the wrapper) | `writeSequenceEnd` |
+| wrapper-array **element** (`struct`/`union`/nested row) | `writeSequenceEndKeep` |
+| array field known to differ from a **non-empty** declared `default` | `writeSequenceEndKeep` |
+
+`writeSequenceEndKeep` behaves like a write: it emits the held-back headers and
+the end marker, so a contentless sequence still reaches the wire as
+`begin` + `end`. It is the safe default when a call site is ambiguous — using it
+where `writeSequenceEnd` would do costs one non-canonical empty frame that every
+decoder normalizes away, while the reverse drops an array element and silently
+changes the decoded array's **length** (MESSAGE_SPEC §5.1).
+
+**How deep the hold-back reaches.** All the way: up to `MAX_DEPTH` (255), the
+format's own nesting ceiling. There is no window past which this encoder gives
+up and frames eagerly, so a sequence closed contentless is omitted at *every*
+depth and the bytes are canonical everywhere (CORELIB_PLAN §6). The price is
+paid in the struct rather than on the heap — the run is reserved inline, 255
+ids, so an `OStream` value is 1072 bytes on a 64-bit target and still allocates
+nothing. Only a heap-free profile is allowed to bound the run instead, and then
+it must publish the bound, because two encoders that disagree about it disagree
+about bytes; this port has no bound to publish.
+
+Held-back ids are encoder state, never buffer content, so a pending run cannot
+straddle a flush — a run costs no buffer space, and the buffer only fills
+through a write, which commits the run before its first byte. Output is
+therefore buffer-size independent: a tiny output buffer produces exactly the
+one-shot bytes.
 
 ### Serialize stream
 
@@ -253,14 +299,18 @@ const got = try Point.decode(wire); // got.x == 3, got.y == 4
 
 ## Memory handling
 
-You own every buffer. The hot path is allocation-free and there is no
-library-owned heap memory anywhere — no allocator is passed in or held.
+You own every buffer. The codec is allocation-free and holds no heap memory —
+`OStream`, `IStream` and `decode` neither take nor keep an allocator.
 
 - **Encode (`OStream`):** you own the output `[]u8`; the library never allocates
   or grows it. With no flush sink, overflow is `error.BufferFull`; with a flush
   callback the buffer drains and is reused (`bufferSet` swaps in a fresh one),
   and `initOffset` reserves leading framing space. Each write copies its bytes
   into the buffer, so caller source strings/slices may be reused immediately.
+  The struct itself is 1072 bytes on a 64-bit target: it reserves the full
+  `MAX_DEPTH` lazy sequence hold-back run inline (see
+  [Serialize](#serialize)), which is what buys canonical framing at every depth
+  without an allocator. Put it wherever you would put a 1 KiB local.
 - **Decode (`decode` / `IStream` + visitor):** you own the input buffer and it
   must outlive the `decode`/`feed` call. `string`/`blob` chunks are borrowed
   slices that point directly into that buffer, valid only during the callback —

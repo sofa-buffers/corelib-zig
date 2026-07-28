@@ -467,7 +467,7 @@ fn encodeSample(buf: []u8) usize {
     os.writeFp64(4, -2.5) catch unreachable;
     os.writeString(5, "hello") catch unreachable;
     os.writeArrayUnsigned(6, &[_]u16{ 10, 20, 30 }) catch unreachable;
-    os.writeSequenceBegin(7) catch unreachable;
+    os.writeSequenceBeginLazy(7) catch unreachable;
     os.writeUnsigned(1, 99) catch unreachable;
     os.writeSequenceEnd() catch unreachable;
     return os.bytesUsed();

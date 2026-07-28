@@ -31,6 +31,21 @@ const Event = common.Event;
 const Id = sofab.Id;
 
 /// The shared vectors, embedded verbatim from the asset copy.
+///
+/// **Which column this suite asserts:** `serialized.hex` — the dense,
+/// primitive-layer ground truth, where every sequence in the op list carries its
+/// frame. That is the only column a corelib *can* assert: this repo has no
+/// message layer, so it has no schema, no declared defaults and therefore no way
+/// to decide that a sequence field equals its default.
+///
+/// The sibling `serialized_sparse.hex` column — the same message with an
+/// all-default sequence *field* omitted (MESSAGE_SPEC §2) — is deliberately
+/// **not** read here. It is produced and checked one layer up, by the
+/// generator's per-language conformance drivers
+/// (`tests/conformance/zig/check_vectors.py` in sofa-buffers/generator), which
+/// own the schema that says what "default" means. What this corelib owes that
+/// layer is the `writeSequenceEnd` / `writeSequenceEndKeep` pair those drivers
+/// build on, covered by the lazy-framing unit tests in `src/ostream.zig`.
 const vectors_json = @embedFile("test_vectors");
 
 // --- JSON helpers -------------------------------------------------------------
@@ -102,9 +117,17 @@ fn writeFields(os: *sofab.OStream, arena: std.mem.Allocator, fields: []const std
         } else if (std.mem.eql(u8, op, "array")) {
             try writeArray(os, arena, id, f);
         } else if (std.mem.eql(u8, op, "sequence_begin")) {
-            try os.writeSequenceBegin(id);
+            try os.writeSequenceBeginLazy(id);
         } else if (std.mem.eql(u8, op, "sequence_end")) {
-            try os.writeSequenceEnd();
+            // The vectors' op list is replayed against the **dense**
+            // `serialized` hex, which always carries the frame — including the
+            // three empty-sequence vectors. So the replay closes with
+            // `writeSequenceEndKeep`: `writeSequenceEnd` would drop a
+            // contentless frame and those vectors would encode to nothing.
+            // (The sparse-canonical form, where the field-position frame *is*
+            // dropped, is the `serialized_sparse` hex — a generated-code
+            // concern, not a raw-encoder replay one.)
+            try os.writeSequenceEndKeep();
         } else {
             @panic("unsupported op in vectors");
         }

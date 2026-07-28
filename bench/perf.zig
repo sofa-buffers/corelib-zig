@@ -45,7 +45,7 @@ fn perfEncode(buf: []u8) usize {
     os.writeArrayUnsigned(9, &perf_samples) catch unreachable;
     os.writeArraySigned(10, &perf_deltas) catch unreachable;
     os.writeArrayFp64(11, &perf_fp64) catch unreachable;
-    os.writeSequenceBegin(12) catch unreachable;
+    os.writeSequenceBeginLazy(12) catch unreachable;
     os.writeUnsigned(1, 99) catch unreachable;
     os.writeSigned(2, -7) catch unreachable;
     os.writeSequenceEnd() catch unreachable;

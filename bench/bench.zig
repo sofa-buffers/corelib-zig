@@ -27,7 +27,7 @@ fn encodeTypical(os: *sofab.OStream) void {
     os.writeFp32(4, 3.14159) catch unreachable;
     os.writeString(5, "sofab") catch unreachable;
     os.writeArrayUnsigned(6, &[_]u16{ 10, 20, 30, 40 }) catch unreachable;
-    os.writeSequenceBegin(7) catch unreachable;
+    os.writeSequenceBeginLazy(7) catch unreachable;
     os.writeUnsigned(1, 99) catch unreachable;
     os.writeSigned(2, -7) catch unreachable;
     os.writeSequenceEnd() catch unreachable;
