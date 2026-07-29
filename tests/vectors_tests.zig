@@ -210,10 +210,11 @@ fn chunkedEncode(arena: std.mem.Allocator, fields: []const std.json.Value, buf_s
 // --- expected decode events -----------------------------------------------------
 
 fn arrayKind(et: []const u8) sofab.ArrayKind {
+    if (std.mem.eql(u8, et, "fp32")) return .fp32;
+    if (std.mem.eql(u8, et, "fp64")) return .fp64;
     return switch (et[0]) {
         'u' => .unsigned,
         'i' => .signed,
-        'f' => .fixlen,
         else => @panic("unknown element_type"),
     };
 }
@@ -250,10 +251,8 @@ fn pushFieldEvents(ev: *std.ArrayList(Event), arena: std.mem.Allocator, f: std.j
                 ev.append(arena, switch (arrayKind(et)) {
                     .unsigned => .{ .unsigned = .{ .id = id, .value = asU64(v) } },
                     .signed => .{ .signed = .{ .id = id, .value = asI64(v) } },
-                    .fixlen => if (std.mem.eql(u8, et, "fp32"))
-                        .{ .fp32 = .{ .id = id, .bits = @bitCast(@as(f32, @floatCast(asF64(v)))) } }
-                    else
-                        .{ .fp64 = .{ .id = id, .bits = @bitCast(asF64(v)) } },
+                    .fp32 => .{ .fp32 = .{ .id = id, .bits = @bitCast(@as(f32, @floatCast(asF64(v)))) } },
+                    .fp64 => .{ .fp64 = .{ .id = id, .bits = @bitCast(asF64(v)) } },
                 }) catch @panic("oom");
             }
             return;
