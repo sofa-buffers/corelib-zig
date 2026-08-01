@@ -99,11 +99,20 @@ pub const FixlenType = enum(u3) {
 
 /// Element category of an array, reported to a visitor's `arrayBegin` at the
 /// start of an array field.
-pub const ArrayKind = enum {
+///
+/// A fixlen array names its **element subtype** here (`fp32` / `fp64`), not
+/// merely "some fixlen array": the receiver must be able to tell whether the
+/// array that arrived is the declared field's value *before* it applies any
+/// schema bound to `count` (CORELIB_PLAN §4.8 step 3, MESSAGE_SPEC §7.3).
+/// The hook therefore fires only once the `fixlen_word` has been read and
+/// validated. Ordinals are fixed across the family.
+pub const ArrayKind = enum(u2) {
     /// Unsigned-integer elements (delivered via the `unsigned` callback).
-    unsigned,
+    unsigned = 0,
     /// Signed-integer elements (delivered via the `signed` callback).
-    signed,
-    /// Floating-point elements (delivered via `fp32` / `fp64`).
-    fixlen,
+    signed = 1,
+    /// 32-bit float elements (delivered via the `fp32` callback).
+    fp32 = 2,
+    /// 64-bit float elements (delivered via the `fp64` callback).
+    fp64 = 3,
 };

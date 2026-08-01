@@ -30,6 +30,8 @@
 //!     // position; a contiguous decode delivers one whole-payload chunk.
 //!     pub fn string(self: *@This(), id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void { ... }
 //!     pub fn blob(self: *@This(), id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void { ... }
+//!     // `kind` names the element category — for a fixlen array its *subtype*
+//!     // (`.fp32` / `.fp64`), reported once the `fixlen_word` has been read.
 //!     pub fn arrayBegin(self: *@This(), id: sofab.Id, kind: sofab.ArrayKind, count: usize) void { ... }
 //!     pub fn sequenceBegin(self: *@This(), id: sofab.Id) void { ... }
 //!     pub fn sequenceEnd(self: *@This()) void { ... }
@@ -327,8 +329,12 @@ pub const IStream = struct {
                         .fp64 => if (elem_len != 8) return Error.InvalidMessage else true,
                         else => return Error.InvalidMessage,
                     };
+                    // The hook fires only here — past the `fixlen_word` — and
+                    // names the element subtype, so the receiver can decide
+                    // whether this array is the declared field's value before
+                    // applying any schema bound to `count` (§4.8 step 3).
                     if (comptime @hasDecl(V, "arrayBegin"))
-                        visitor.arrayBegin(id, .fixlen, @intCast(count));
+                        visitor.arrayBegin(id, if (fp64) ArrayKind.fp64 else ArrayKind.fp32, @intCast(count));
                     if (count > 0) {
                         self.state = .{ .array_fix = .{
                             .id = id,
