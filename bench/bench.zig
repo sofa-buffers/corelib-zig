@@ -33,16 +33,41 @@ fn encodeTypical(os: *sofab.OStream) void {
     os.writeSequenceEnd() catch unreachable;
 }
 
+/// How long one batch of operations runs before the clock is read again.
+///
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` is a real syscall — never
+/// vDSO-accelerated — costing on the order of a microsecond, so reading it
+/// once per operation times the clock rather than the codec. Ten milliseconds
+/// of work per read puts the clock cost under ~0.01% of a batch.
+const batch_seconds: f64 = 0.01;
+
+/// Grow a batch until it spans `batch_seconds`, so the single clock read that
+/// ends it is a rounding error against the work it timed. Doubles as warmup.
+fn calibrateBatch(ctx: anytype) u64 {
+    var batch: u64 = 1;
+    while (true) : (batch *= 2) {
+        const t0 = util.cpuNow();
+        var k: u64 = 0;
+        while (k < batch) : (k += 1) ctx.run();
+        if (util.cpuNow() - t0 >= batch_seconds) return batch;
+    }
+}
+
 /// Run `ctx.run()` repeatedly until ~1 s of CPU time has elapsed (after one
 /// warm-up call) and return throughput in MB/s for a message of `bytes` bytes.
+///
+/// The clock is read once per batch, never per operation — see
+/// `batch_seconds`.
 fn measure(bytes: usize, ctx: anytype) f64 {
     ctx.run(); // warmup
+    const batch = calibrateBatch(ctx);
     const t0 = util.cpuNow();
     var it: u64 = 0;
     var el: f64 = undefined;
     while (true) {
-        ctx.run();
-        it += 1;
+        var k: u64 = 0;
+        while (k < batch) : (k += 1) ctx.run();
+        it += batch;
         el = util.cpuNow() - t0;
         if (el >= 1.0) break;
     }

@@ -133,9 +133,31 @@ fn perfReport(out: anytype, what: []const u8, r: PerfResult, bytes: usize) !void
     try out.print("  throughput    : {d:.1} MB/s  (speedtest, MB = 1e6 bytes)\n", .{r.mb_s});
 }
 
+/// How long one batch of operations runs before the clock is read again.
+///
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` is a real syscall — never
+/// vDSO-accelerated — costing on the order of a microsecond, so reading it
+/// once per operation times the clock rather than the codec (and the cycle
+/// counter bracketing the loop absorbs it too). Ten milliseconds of work per
+/// read puts the clock cost under ~0.01% of a batch.
+const batch_seconds: f64 = 0.01;
+
+/// Grow a batch until it spans `batch_seconds`, so the single clock read that
+/// ends it is a rounding error against the work it timed. Doubles as warmup.
+fn calibrateBatch(ctx: anytype) u64 {
+    var batch: u64 = 1;
+    while (true) : (batch *= 2) {
+        const t0 = util.cpuNow();
+        var k: u64 = 0;
+        while (k < batch) : (k += 1) std.mem.doNotOptimizeAway(ctx.run());
+        if (util.cpuNow() - t0 >= batch_seconds) return batch;
+    }
+}
+
 fn measureEncode(ctx: anytype) struct { PerfResult, usize } {
     var msg: usize = 0;
     for (0..1000) |_| msg = ctx.run(); // warmup
+    const batch = calibrateBatch(ctx);
 
     var sink: usize = 0;
     var it: u64 = 0;
@@ -143,8 +165,9 @@ fn measureEncode(ctx: anytype) struct { PerfResult, usize } {
     const t0 = util.cpuNow();
     var el: f64 = undefined;
     while (true) {
-        sink +%= ctx.run();
-        it += 1;
+        var k: u64 = 0;
+        while (k < batch) : (k += 1) sink +%= ctx.run();
+        it += batch;
         el = util.cpuNow() - t0;
         if (el >= 1.0) break;
     }
@@ -160,12 +183,23 @@ fn measureEncode(ctx: anytype) struct { PerfResult, usize } {
     }, msg };
 }
 
+const DecodeCtx = struct {
+    buf: []const u8,
+
+    fn run(self: @This()) u64 {
+        var o: PerfOut = .{};
+        perfDecode(self.buf, &o);
+        return o.acc;
+    }
+};
+
 fn measureDecode(buf: []const u8) PerfResult {
     for (0..1000) |_| {
         var out: PerfOut = .{};
         perfDecode(buf, &out); // warmup
         std.mem.doNotOptimizeAway(out.acc);
     }
+    const batch = calibrateBatch(DecodeCtx{ .buf = buf });
 
     var sink: u64 = 0;
     var it: u64 = 0;
@@ -173,10 +207,13 @@ fn measureDecode(buf: []const u8) PerfResult {
     const t0 = util.cpuNow();
     var el: f64 = undefined;
     while (true) {
-        var o: PerfOut = .{};
-        perfDecode(buf, &o);
-        sink +%= o.acc;
-        it += 1;
+        var k: u64 = 0;
+        while (k < batch) : (k += 1) {
+            var o: PerfOut = .{};
+            perfDecode(buf, &o);
+            sink +%= o.acc;
+        }
+        it += batch;
         el = util.cpuNow() - t0;
         if (el >= 1.0) break;
     }
