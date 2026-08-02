@@ -55,6 +55,10 @@ const ArrayKind = types.ArrayKind;
 /// streamed via `Resume`, never buffered.
 const CARRY_CAP = 64;
 
+/// Element count from which an integer array is worth handing to the bulk
+/// decoder (`intArrayRun`) rather than decoding inline in the tail loop.
+const BULK_MIN_ELEMS = 8;
+
 /// What the decoder was in the middle of when the previous chunk ran out.
 ///
 /// Small items (a split varint or float) are not represented here — they are
@@ -189,17 +193,35 @@ pub const IStream = struct {
     fn parse(self: *IStream, buf: []const u8, visitor: anytype) Error!usize {
         const V = std.meta.Child(@TypeOf(visitor));
         var pos: usize = 0;
-        while (true) {
+        // The resume check is the *outer* loop and the field loop is nested
+        // inside it, so an ordinary scalar field never re-tests `self.state`:
+        // it is only reachable on entry to `parse` and after a field that
+        // actually starts a long item (a payload or an array). Each arm below
+        // either returns — still hungry — or finishes, sets `.none`, and falls
+        // through to the field loop.
+        resume_loop: while (true) {
             // 1) Finish anything left in progress from a previous chunk.
             switch (self.state) {
                 .none => {},
                 .payload => {
                     pos = self.deliverPayload(buf, pos, visitor);
                     if (self.state == .payload) return pos; // still hungry
-                    continue;
                 },
                 .array_int => |st| {
+                    // Bulk run first, in its own function (see `intArrayRun`),
+                    // then the tail — the last few elements of the chunk, any
+                    // of which may be cut short by the end of the input.
+                    // The bulk path exists to amortize its constant hoisting
+                    // over many elements; below a handful its call setup costs
+                    // more than it saves, so a short array goes straight to the
+                    // tail loop.
                     var rem = st.remaining;
+                    if (rem >= BULK_MIN_ELEMS) {
+                        rem = if (st.signed)
+                            try intArrayRun(buf, &pos, rem, st.id, true, visitor)
+                        else
+                            try intArrayRun(buf, &pos, rem, st.id, false, visitor);
+                    }
                     while (rem > 0) {
                         const elem_start = pos;
                         if (try varint.readVarint(buf, &pos)) |val| {
@@ -221,7 +243,6 @@ pub const IStream = struct {
                         }
                     }
                     self.state = .none;
-                    continue;
                 },
                 .array_fix => |st| {
                     const elem_len: usize = if (st.fp64) 8 else 4;
@@ -240,122 +261,128 @@ pub const IStream = struct {
                         rem -= 1;
                     }
                     self.state = .none;
-                    continue;
                 },
             }
 
-            // 2) Read the next field header.
-            if (pos >= buf.len) return pos;
-            const field_start = pos;
-            const header = (try varint.readVarint(buf, &pos)) orelse return field_start;
-            const wire: u3 = @truncate(header);
-            const id_raw = header >> 3;
-            if (id_raw > types.ID_MAX) return Error.InvalidMessage;
-            const id: Id = @intCast(id_raw);
+            // 2) Field loop: read and dispatch fields back to back. Only a
+            // field that starts a long item breaks out to the resume check.
+            while (true) {
+                if (pos >= buf.len) return pos;
+                const field_start = pos;
+                const header = (try varint.readVarint(buf, &pos)) orelse return field_start;
+                const wire: u3 = @truncate(header);
+                const id_raw = header >> 3;
+                if (id_raw > types.ID_MAX) return Error.InvalidMessage;
+                const id: Id = @intCast(id_raw);
 
-            switch (wire) {
-                types.T_VARINT_UNSIGNED => {
-                    const val = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                    if (comptime @hasDecl(V, "unsigned")) visitor.unsigned(id, val);
-                },
-                types.T_VARINT_SIGNED => {
-                    const zz = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                    if (comptime @hasDecl(V, "signed")) visitor.signed(id, varint.zigzagDecode(zz));
-                },
+                switch (wire) {
+                    types.T_VARINT_UNSIGNED => {
+                        const val = (try varint.readVarint(buf, &pos)) orelse return field_start;
+                        if (comptime @hasDecl(V, "unsigned")) visitor.unsigned(id, val);
+                    },
+                    types.T_VARINT_SIGNED => {
+                        const zz = (try varint.readVarint(buf, &pos)) orelse return field_start;
+                        if (comptime @hasDecl(V, "signed")) visitor.signed(id, varint.zigzagDecode(zz));
+                    },
 
-                types.T_FIXLEN => {
-                    const word = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                    const subtype = try FixlenType.fromRaw(@truncate(word));
-                    if (word >> 3 > types.FIXLEN_MAX) return Error.InvalidMessage;
-                    const len: usize = @intCast(word >> 3);
-                    switch (subtype) {
-                        .fp32, .fp64 => {
-                            const want: usize = if (subtype == .fp64) 8 else 4;
-                            if (len != want) return Error.InvalidMessage;
-                            if (buf.len - pos < want) return field_start; // carry header+word+partial
-                            emitFixlenValue(buf, pos, subtype == .fp64, id, visitor);
-                            pos += want;
-                        },
-                        .string, .blob => {
-                            const is_blob = subtype == .blob;
-                            if (len == 0) {
-                                if (is_blob) {
-                                    if (comptime @hasDecl(V, "blob")) visitor.blob(id, 0, 0, &.{});
+                    types.T_FIXLEN => {
+                        const word = (try varint.readVarint(buf, &pos)) orelse return field_start;
+                        const subtype = try FixlenType.fromRaw(@truncate(word));
+                        if (word >> 3 > types.FIXLEN_MAX) return Error.InvalidMessage;
+                        const len: usize = @intCast(word >> 3);
+                        switch (subtype) {
+                            .fp32, .fp64 => {
+                                const want: usize = if (subtype == .fp64) 8 else 4;
+                                if (len != want) return Error.InvalidMessage;
+                                if (buf.len - pos < want) return field_start; // carry header+word+partial
+                                emitFixlenValue(buf, pos, subtype == .fp64, id, visitor);
+                                pos += want;
+                            },
+                            .string, .blob => {
+                                const is_blob = subtype == .blob;
+                                if (len == 0) {
+                                    if (is_blob) {
+                                        if (comptime @hasDecl(V, "blob")) visitor.blob(id, 0, 0, &.{});
+                                    } else {
+                                        if (comptime @hasDecl(V, "string")) visitor.string(id, 0, 0, &.{});
+                                    }
                                 } else {
-                                    if (comptime @hasDecl(V, "string")) visitor.string(id, 0, 0, &.{});
+                                    self.state = .{ .payload = .{
+                                        .id = id,
+                                        .is_blob = is_blob,
+                                        .total = len,
+                                        .remaining = len,
+                                    } };
+                                    pos = self.deliverPayload(buf, pos, visitor);
+                                    if (self.state == .payload) return pos;
+                                    // Fully delivered: state is back to `.none`,
+                                    // so the field loop simply carries on.
                                 }
-                            } else {
-                                self.state = .{ .payload = .{
-                                    .id = id,
-                                    .is_blob = is_blob,
-                                    .total = len,
-                                    .remaining = len,
-                                } };
-                                pos = self.deliverPayload(buf, pos, visitor);
-                                if (self.state == .payload) return pos;
-                            }
-                        },
-                    }
-                },
+                            },
+                        }
+                    },
 
-                types.T_VARINTARRAY_UNSIGNED, types.T_VARINTARRAY_SIGNED => {
-                    const count = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                    if (count > types.ARRAY_MAX) return Error.InvalidMessage;
-                    const is_signed = wire == types.T_VARINTARRAY_SIGNED;
-                    if (comptime @hasDecl(V, "arrayBegin"))
-                        visitor.arrayBegin(id, if (is_signed) ArrayKind.signed else ArrayKind.unsigned, @intCast(count));
-                    if (count > 0) {
-                        self.state = .{ .array_int = .{
-                            .id = id,
-                            .signed = is_signed,
-                            .remaining = @intCast(count),
-                        } };
-                    }
-                },
-                types.T_FIXLENARRAY => {
-                    const count = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                    if (count > types.ARRAY_MAX) return Error.InvalidMessage;
-                    // A fixlen array **always** carries its `fixlen_word`, even
-                    // when empty (count == 0) — this is what distinguishes an
-                    // empty fp32 array from an empty fp64 array on the wire
-                    // (§4.8).
-                    const word = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                    const subtype = try FixlenType.fromRaw(@truncate(word));
-                    const elem_len: usize = @intCast(word >> 3);
-                    // Only fixed-width float subtypes are valid in a fixlen
-                    // array; string/blob must use a sequence instead.
-                    const fp64 = switch (subtype) {
-                        .fp32 => if (elem_len != 4) return Error.InvalidMessage else false,
-                        .fp64 => if (elem_len != 8) return Error.InvalidMessage else true,
-                        else => return Error.InvalidMessage,
-                    };
-                    // The hook fires only here — past the `fixlen_word` — and
-                    // names the element subtype, so the receiver can decide
-                    // whether this array is the declared field's value before
-                    // applying any schema bound to `count` (§4.8 step 3).
-                    if (comptime @hasDecl(V, "arrayBegin"))
-                        visitor.arrayBegin(id, if (fp64) ArrayKind.fp64 else ArrayKind.fp32, @intCast(count));
-                    if (count > 0) {
-                        self.state = .{ .array_fix = .{
-                            .id = id,
-                            .fp64 = fp64,
-                            .remaining = @intCast(count),
-                        } };
-                    }
-                },
+                    types.T_VARINTARRAY_UNSIGNED, types.T_VARINTARRAY_SIGNED => {
+                        const count = (try varint.readVarint(buf, &pos)) orelse return field_start;
+                        if (count > types.ARRAY_MAX) return Error.InvalidMessage;
+                        const is_signed = wire == types.T_VARINTARRAY_SIGNED;
+                        if (comptime @hasDecl(V, "arrayBegin"))
+                            visitor.arrayBegin(id, if (is_signed) ArrayKind.signed else ArrayKind.unsigned, @intCast(count));
+                        if (count > 0) {
+                            self.state = .{ .array_int = .{
+                                .id = id,
+                                .signed = is_signed,
+                                .remaining = @intCast(count),
+                            } };
+                            continue :resume_loop; // the elements are read there
+                        }
+                    },
+                    types.T_FIXLENARRAY => {
+                        const count = (try varint.readVarint(buf, &pos)) orelse return field_start;
+                        if (count > types.ARRAY_MAX) return Error.InvalidMessage;
+                        // A fixlen array **always** carries its `fixlen_word`, even
+                        // when empty (count == 0) — this is what distinguishes an
+                        // empty fp32 array from an empty fp64 array on the wire
+                        // (§4.8).
+                        const word = (try varint.readVarint(buf, &pos)) orelse return field_start;
+                        const subtype = try FixlenType.fromRaw(@truncate(word));
+                        const elem_len: usize = @intCast(word >> 3);
+                        // Only fixed-width float subtypes are valid in a fixlen
+                        // array; string/blob must use a sequence instead.
+                        const fp64 = switch (subtype) {
+                            .fp32 => if (elem_len != 4) return Error.InvalidMessage else false,
+                            .fp64 => if (elem_len != 8) return Error.InvalidMessage else true,
+                            else => return Error.InvalidMessage,
+                        };
+                        // The hook fires only here — past the `fixlen_word` — and
+                        // names the element subtype, so the receiver can decide
+                        // whether this array is the declared field's value before
+                        // applying any schema bound to `count` (§4.8 step 3).
+                        if (comptime @hasDecl(V, "arrayBegin"))
+                            visitor.arrayBegin(id, if (fp64) ArrayKind.fp64 else ArrayKind.fp32, @intCast(count));
+                        if (count > 0) {
+                            self.state = .{ .array_fix = .{
+                                .id = id,
+                                .fp64 = fp64,
+                                .remaining = @intCast(count),
+                            } };
+                            continue :resume_loop; // the elements are read there
+                        }
+                    },
 
-                types.T_SEQUENCE_START => {
-                    // Reject nesting beyond MAX_DEPTH (255) rather than risk
-                    // unbounded recursion / stack growth (§4.9, §6.2).
-                    if (self.depth >= types.MAX_DEPTH) return Error.InvalidMessage;
-                    self.depth += 1;
-                    if (comptime @hasDecl(V, "sequenceBegin")) visitor.sequenceBegin(id);
-                },
-                types.T_SEQUENCE_END => {
-                    if (self.depth == 0) return Error.InvalidMessage;
-                    self.depth -= 1;
-                    if (comptime @hasDecl(V, "sequenceEnd")) visitor.sequenceEnd();
-                },
+                    types.T_SEQUENCE_START => {
+                        // Reject nesting beyond MAX_DEPTH (255) rather than risk
+                        // unbounded recursion / stack growth (§4.9, §6.2).
+                        if (self.depth >= types.MAX_DEPTH) return Error.InvalidMessage;
+                        self.depth += 1;
+                        if (comptime @hasDecl(V, "sequenceBegin")) visitor.sequenceBegin(id);
+                    },
+                    types.T_SEQUENCE_END => {
+                        if (self.depth == 0) return Error.InvalidMessage;
+                        self.depth -= 1;
+                        if (comptime @hasDecl(V, "sequenceEnd")) visitor.sequenceEnd();
+                    },
+                }
             }
         }
     }
@@ -387,6 +414,52 @@ pub const IStream = struct {
         return pos;
     }
 };
+
+/// Decode the bulk of an integer array: elements from `buf[pos.*..]` for as
+/// long as a maximum-length varint is guaranteed to be present, so no element
+/// can straddle the end of the chunk and the SWAR decoder runs with no
+/// per-element "is it all here?" bookkeeping. Returns the elements still
+/// outstanding; `pos.*` is advanced past everything consumed.
+///
+/// **`noinline` on purpose.** The SWAR cascade needs five 64-bit mask
+/// constants, and x86-64 has no 64-bit immediate AND — each one costs a
+/// `movabs` unless it can live in a register across the loop. Inlined into
+/// `parse`, whose register pressure is set by the whole field-dispatch switch,
+/// they get rematerialized every single element. In a function of its own the
+/// loop keeps them in registers and pays for them once per array. The call is
+/// per array, not per element, so it costs nothing measurable.
+///
+/// `is_signed` is comptime so the ZigZag mapping and the visitor dispatch stay
+/// off the per-element path.
+noinline fn intArrayRun(
+    buf: []const u8,
+    pos: *usize,
+    remaining: usize,
+    id: Id,
+    comptime is_signed: bool,
+    visitor: anytype,
+) Error!usize {
+    const V = std.meta.Child(@TypeOf(visitor));
+    // Exclusive cursor limit for the headroom guarantee — 0 when the chunk is
+    // too short to give any element the full `MAX_VARINT_LEN` bytes.
+    const fast_end: usize = if (buf.len >= varint.MAX_VARINT_LEN)
+        buf.len - varint.MAX_VARINT_LEN + 1
+    else
+        0;
+    var p = pos.*;
+    var rem = remaining;
+    while (rem > 0 and p < fast_end) : (rem -= 1) {
+        const d = try varint.readVarintFast(buf.ptr + p);
+        p += d.len;
+        if (is_signed) {
+            if (comptime @hasDecl(V, "signed")) visitor.signed(id, varint.zigzagDecode(d.value));
+        } else {
+            if (comptime @hasDecl(V, "unsigned")) visitor.unsigned(id, d.value);
+        }
+    }
+    pos.* = p;
+    return rem;
+}
 
 /// Decode 4 or 8 little-endian float bytes at `buf[pos..]` and push them to the
 /// visitor. Caller guarantees the bytes are present; the loads go through the

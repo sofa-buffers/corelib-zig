@@ -97,6 +97,82 @@ test "roundtrip: one-shot encode equals chunked encode, one-shot decode equals c
     }
 }
 
+test "integer arrays survive every encode-buffer and decode-chunk boundary" {
+    // Targets the seam between the bulk codec paths — which require a whole
+    // maximum-length varint of headroom — and the byte-at-a-time paths that
+    // take over near the end of a buffer. Every buffer size from 1 up to past
+    // that headroom puts the transition at a different element, and every chunk
+    // size does the same on the way back in, so an element split across the
+    // seam (or an element the bulk loop wrongly claimed it could fit) shows up
+    // as a byte difference rather than as luck.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Values spanning all ten varint lengths, both sides of each boundary, plus
+    // the full-width spread the benchmark generator produces — the encodings
+    // most likely to straddle a seam.
+    var u_vals: std.ArrayList(u64) = .empty;
+    var i_vals: std.ArrayList(i64) = .empty;
+    var shift: u6 = 0;
+    while (true) : (shift += 7) {
+        const b = @as(u64, 1) << shift;
+        try u_vals.appendSlice(arena, &.{ b -| 1, b, b + 1 });
+        try i_vals.appendSlice(arena, &.{ @bitCast(b), -%@as(i64, @bitCast(b)), @intCast(shift) });
+        if (shift >= 63) break;
+    }
+    for (0..64) |k| {
+        try u_vals.append(arena, @as(u64, k) *% 0x9E37_79B9_7F4A_7C15);
+        try i_vals.append(arena, @bitCast(@as(u64, k) *% 0xC2B2_AE3D_27D4_EB4F));
+    }
+    try u_vals.appendSlice(arena, &.{ 0, std.math.maxInt(u64) });
+    try i_vals.appendSlice(arena, &.{ 0, std.math.minInt(i64), std.math.maxInt(i64) });
+
+    const Collector = struct {
+        data: [8192]u8 = undefined,
+        len: usize = 0,
+        fn push(ctx: ?*anyopaque, chunk: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(self.data[self.len..][0..chunk.len], chunk);
+            self.len += chunk.len;
+        }
+    };
+
+    // One-shot reference bytes.
+    var big: [8192]u8 = undefined;
+    var os = sofab.OStream.init(&big);
+    try os.writeArrayUnsigned(1, u_vals.items);
+    try os.writeArraySigned(2, i_vals.items);
+    const message = big[0..os.bytesUsed()];
+
+    // Encode through every buffer size across the headroom threshold.
+    var bs: usize = 1;
+    while (bs <= 24) : (bs += 1) {
+        var out: Collector = .{};
+        var scratch: [24]u8 = undefined;
+        var cos = sofab.OStream.initFlush(scratch[0..bs], 0, &out, Collector.push);
+        try cos.writeArrayUnsigned(1, u_vals.items);
+        try cos.writeArraySigned(2, i_vals.items);
+        _ = cos.flush();
+        try std.testing.expectEqualSlices(u8, message, out.data[0..out.len]);
+    }
+
+    // Decode at every chunk size across the same threshold.
+    var whole = common.Recorder.init(arena);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(message, &whole));
+    var cs: usize = 1;
+    while (cs <= 24) : (cs += 1) {
+        var rec = common.Recorder.init(arena);
+        var is = sofab.IStream.init();
+        var pos: usize = 0;
+        while (pos < message.len) : (pos += cs) {
+            _ = try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
+        }
+        try std.testing.expectEqual(sofab.Status.complete, is.status());
+        try common.expectEventsEqual(whole.events.items, rec.events.items);
+    }
+}
+
 test "roundtrip: values survive bit-exactly" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
