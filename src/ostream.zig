@@ -121,9 +121,24 @@ pub const OStream = struct {
         self.offset = 0;
     }
 
-    /// Copy a raw byte slice out, draining the buffer as needed. Uses a bulk
-    /// `@memcpy` per buffer-sized run rather than a byte-at-a-time loop.
+    /// Copy a raw byte slice out, draining the buffer as needed: a bulk
+    /// `@memcpy` per buffer-sized run rather than a byte-at-a-time loop, and an
+    /// inline copy for payloads short enough that the call would dominate.
     fn pushRaw(self: *OStream, data: []const u8) Error!void {
+        // Fast path: the whole payload fits in the buffer as it stands, so no
+        // drain can intervene. Short payloads — a float, a small string — are
+        // the common case, and at those sizes the `memcpy` *call* costs several
+        // times the copy itself, so they are copied inline instead.
+        if (data.len <= self.buffer.len - self.offset) {
+            const dst = self.buffer.ptr + self.offset;
+            self.offset += data.len;
+            if (data.len <= 8) {
+                for (data, 0..) |b, i| dst[i] = b;
+            } else {
+                @memcpy(dst[0..data.len], data);
+            }
+            return;
+        }
         var rest = data;
         while (rest.len > 0) {
             if (self.offset >= self.buffer.len) try self.drainFull();
@@ -142,18 +157,57 @@ pub const OStream = struct {
     /// per-byte capacity check.
     inline fn writeVarint(self: *OStream, value: Unsigned) Error!void {
         if (self.buffer.len - self.offset >= varint.MAX_VARINT_LEN) {
-            var v = value;
-            var i = self.offset;
-            while (v >= 0x80) {
-                self.buffer.ptr[i] = @as(u8, @truncate(v)) | 0x80;
-                v >>= 7;
-                i += 1;
-            }
-            self.buffer.ptr[i] = @truncate(v);
-            self.offset = i + 1;
+            // The headroom check is exactly `writeVarintFast`'s precondition:
+            // it stores a whole 64-bit word, so the scratch it leaves past the
+            // varint stays inside the buffer and the next write overwrites it.
+            self.offset += varint.writeVarintFast(self.buffer.ptr + self.offset, value);
             return;
         }
         return self.writeVarintSlow(value);
+    }
+
+    /// Encode every element of `data` as a varint back to back, ZigZag-mapping
+    /// them first when `is_signed`.
+    ///
+    /// The cursor lives in **locals** for the whole run. Going through
+    /// `writeVarint` per element would reload `self.offset` and `self.buffer`
+    /// every time: the stores go through the buffer pointer, which the
+    /// optimizer cannot prove does not alias the stream itself, so the state
+    /// has to be re-read after each one. Hoisting it leaves one headroom test
+    /// per element against a register, and the state is written back once.
+    ///
+    /// Only the element that runs out of headroom can need a flush mid-value,
+    /// so it alone takes the checked byte-at-a-time writer; the loop then
+    /// re-reads the (possibly swapped) buffer and continues.
+    inline fn writeVarintRun(self: *OStream, data: anytype, comptime is_signed: bool) Error!void {
+        var i: usize = 0;
+        while (i < data.len) {
+            const base = self.buffer.ptr;
+            var off = self.offset;
+            // How many elements are certain to fit without re-testing capacity:
+            // the worst case is `MAX_VARINT_LEN` bytes each, so this many can be
+            // written back to back. Bounding the run up front leaves the inner
+            // loop with a single induction-variable compare instead of a
+            // capacity test and an element test per element.
+            const run = @min((self.buffer.len - off) / varint.MAX_VARINT_LEN, data.len - i);
+            const end = i + run;
+            while (i < end) : (i += 1) {
+                const v: Unsigned = if (is_signed) varint.zigzagEncode(data[i]) else data[i];
+                off += varint.writeVarintFast(base + off, v);
+            }
+            self.offset = off;
+            // `run == 0` is the only case the fast path cannot make progress on:
+            // there is not enough headroom left for even one worst-case varint,
+            // so this element is the one that may need a flush partway through.
+            // Otherwise loop back and re-measure — the elements just written
+            // were usually shorter than the worst case, so more headroom remains
+            // than the conservative `run` assumed.
+            if (run == 0) {
+                const v: Unsigned = if (is_signed) varint.zigzagEncode(data[i]) else data[i];
+                try self.writeVarintSlow(v);
+                i += 1;
+            }
+        }
     }
 
     /// Byte-at-a-time varint encode used near the end of the buffer, where
@@ -218,18 +272,51 @@ pub const OStream = struct {
         self.npending = 0;
     }
 
+    /// Headroom that guarantees a field header *and* one following varint fit
+    /// without re-testing capacity between them.
+    const PAIR_HEADROOM = 2 * varint.MAX_VARINT_LEN;
+
+    /// Write a field header immediately followed by `word` — the shape of every
+    /// non-sequence field: a scalar's value, a fixlen's length/subtype word, an
+    /// array's element count.
+    ///
+    /// The point is the **single** capacity test. Writing the two through
+    /// `writeIdType` + `writeVarint` re-reads `self.offset` and `self.buffer`
+    /// between them, because the first store goes through the buffer pointer
+    /// and the optimizer cannot prove it does not alias the stream itself.
+    /// With the headroom established once, both go out through a local cursor
+    /// and the state is written back a single time.
+    ///
+    /// Every condition the general path enforces is a condition for taking the
+    /// fast one, so the fallback preserves semantics exactly: an out-of-range
+    /// `id` still reaches `writeIdType`'s `InvalidArgument`, a held-back
+    /// sequence run still reaches `commitPending`, and a buffer too full still
+    /// reaches the drain/flush path.
+    inline fn writeHeaderAnd(self: *OStream, id: Id, wire_type: u3, word: Unsigned) Error!void {
+        if (self.npending == 0 and id <= types.ID_MAX and
+            self.buffer.len - self.offset >= PAIR_HEADROOM)
+        {
+            const base = self.buffer.ptr;
+            var off = self.offset;
+            off += varint.writeVarintFast(base + off, (@as(Unsigned, id) << 3) | wire_type);
+            off += varint.writeVarintFast(base + off, word);
+            self.offset = off;
+            return;
+        }
+        try self.writeIdType(id, wire_type);
+        try self.writeVarint(word);
+    }
+
     // --- scalar writers -----------------------------------------------------
 
     /// Write an unsigned-integer field.
     pub fn writeUnsigned(self: *OStream, id: Id, value: Unsigned) Error!void {
-        try self.writeIdType(id, types.T_VARINT_UNSIGNED);
-        try self.writeVarint(value);
+        return self.writeHeaderAnd(id, types.T_VARINT_UNSIGNED, value);
     }
 
     /// Write a signed-integer field (ZigZag + varint).
     pub fn writeSigned(self: *OStream, id: Id, value: Signed) Error!void {
-        try self.writeIdType(id, types.T_VARINT_SIGNED);
-        try self.writeVarint(varint.zigzagEncode(value));
+        return self.writeHeaderAnd(id, types.T_VARINT_SIGNED, varint.zigzagEncode(value));
     }
 
     /// Write a boolean as an unsigned `0` / `1` (booleans have no wire type of
@@ -244,21 +331,44 @@ pub const OStream = struct {
     /// the raw `data` bytes (already in wire/little-endian order for floats).
     pub fn writeFixlen(self: *OStream, id: Id, data: []const u8, subtype: FixlenType) Error!void {
         if (data.len > types.FIXLEN_MAX) return Error.InvalidArgument;
-        try self.writeIdType(id, types.T_FIXLEN);
-        try self.writeVarint((@as(Unsigned, data.len) << 3) | @intFromEnum(subtype));
+        try self.writeHeaderAnd(id, types.T_FIXLEN, (@as(Unsigned, data.len) << 3) | @intFromEnum(subtype));
         try self.pushRaw(data);
+    }
+
+    /// Write a fixlen field whose payload width is known at compile time.
+    ///
+    /// The payload arrives as its raw **bit pattern**, never as a float value,
+    /// so nothing in this path can quiet a signaling NaN (CORELIB_PLAN §6.5);
+    /// and because the width is comptime, the payload is a single store instead
+    /// of a stack temporary handed to the slice-copying `pushRaw`.
+    inline fn writeFixedFixlen(
+        self: *OStream,
+        id: Id,
+        comptime T: type,
+        bits: T,
+        comptime subtype: FixlenType,
+    ) Error!void {
+        const N = @sizeOf(T);
+        try self.writeHeaderAnd(id, types.T_FIXLEN, (@as(Unsigned, N) << 3) | @intFromEnum(subtype));
+        if (self.buffer.len - self.offset >= N) {
+            std.mem.writeInt(T, (self.buffer.ptr + self.offset)[0..N], bits, .little);
+            self.offset += N;
+            return;
+        }
+        // Straddles the end of the buffer: fall back to the draining copy.
+        var le: [N]u8 = undefined;
+        std.mem.writeInt(T, &le, bits, .little);
+        return self.pushRaw(&le);
     }
 
     /// Write a 32-bit float field.
     pub fn writeFp32(self: *OStream, id: Id, value: f32) Error!void {
-        const le = std.mem.toBytes(std.mem.nativeToLittle(u32, @bitCast(value)));
-        try self.writeFixlen(id, &le, .fp32);
+        return self.writeFixedFixlen(id, u32, @bitCast(value), .fp32);
     }
 
     /// Write a 64-bit float field.
     pub fn writeFp64(self: *OStream, id: Id, value: f64) Error!void {
-        const le = std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(value)));
-        try self.writeFixlen(id, &le, .fp64);
+        return self.writeFixedFixlen(id, u64, @bitCast(value), .fp64);
     }
 
     /// Write a string field (UTF-8 bytes, no NUL on the wire).
@@ -297,9 +407,8 @@ pub const OStream = struct {
                 @compileError("writeArrayUnsigned expects elements of u8..u64, got " ++ @typeName(E));
         }
         if (data.len > types.ARRAY_MAX) return Error.InvalidArgument;
-        try self.writeIdType(id, types.T_VARINTARRAY_UNSIGNED);
-        try self.writeVarint(@as(Unsigned, data.len));
-        for (data) |e| try self.writeVarint(e);
+        try self.writeHeaderAnd(id, types.T_VARINTARRAY_UNSIGNED, @as(Unsigned, data.len));
+        try self.writeVarintRun(data, false);
     }
 
     /// Write an array of signed integers (`i8`/`i16`/`i32`/`i64` elements).
@@ -314,9 +423,8 @@ pub const OStream = struct {
                 @compileError("writeArraySigned expects elements of i8..i64, got " ++ @typeName(E));
         }
         if (data.len > types.ARRAY_MAX) return Error.InvalidArgument;
-        try self.writeIdType(id, types.T_VARINTARRAY_SIGNED);
-        try self.writeVarint(@as(Unsigned, data.len));
-        for (data) |e| try self.writeVarint(varint.zigzagEncode(e));
+        try self.writeHeaderAnd(id, types.T_VARINTARRAY_SIGNED, @as(Unsigned, data.len));
+        try self.writeVarintRun(data, true);
     }
 
     /// Write an array of 32-bit floats.
@@ -328,8 +436,7 @@ pub const OStream = struct {
     /// array on the wire (§4.8).
     pub fn writeArrayFp32(self: *OStream, id: Id, data: []const f32) Error!void {
         if (data.len > types.ARRAY_MAX) return Error.InvalidArgument;
-        try self.writeIdType(id, types.T_FIXLENARRAY);
-        try self.writeVarint(@as(Unsigned, data.len));
+        try self.writeHeaderAnd(id, types.T_FIXLENARRAY, @as(Unsigned, data.len));
         try self.writeVarint((4 << 3) | @as(Unsigned, @intFromEnum(FixlenType.fp32)));
         if (comptime native_endian == .little) {
             // Little-endian host: the in-memory floats already are the wire
@@ -347,8 +454,7 @@ pub const OStream = struct {
     /// `fixlen_word` rule.
     pub fn writeArrayFp64(self: *OStream, id: Id, data: []const f64) Error!void {
         if (data.len > types.ARRAY_MAX) return Error.InvalidArgument;
-        try self.writeIdType(id, types.T_FIXLENARRAY);
-        try self.writeVarint(@as(Unsigned, data.len));
+        try self.writeHeaderAnd(id, types.T_FIXLENARRAY, @as(Unsigned, data.len));
         try self.writeVarint((8 << 3) | @as(Unsigned, @intFromEnum(FixlenType.fp64)));
         if (comptime native_endian == .little) {
             try self.pushRaw(std.mem.sliceAsBytes(data));
