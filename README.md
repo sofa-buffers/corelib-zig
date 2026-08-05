@@ -312,14 +312,27 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
   [Serialize](#serialize)), which is what buys canonical framing at every depth
   without an allocator. Put it wherever you would put a 1 KiB local.
 - **Decode (`decode` / `IStream` + visitor):** you own the input buffer and it
-  must outlive the `decode`/`feed` call. `string`/`blob` chunks are borrowed
-  slices that point directly into that buffer, valid only during the callback —
-  copy them out to keep them. Scalars and floats arrive by value.
+  must outlive the `decode`/`feed` call. A `string`/`blob` chunk is a borrowed
+  slice; where it borrows from — and therefore how long it stays valid — depends
+  on the path. Scalars and floats always arrive by value.
+  - **`decode` (whole message in one buffer):** every delivered slice points
+    directly into the caller's input buffer, and is **valid for that buffer's
+    lifetime** — you may retain it as long as you keep the input buffer alive,
+    not merely for the duration of the callback. This is the guarantee the
+    zero-copy decode rests on: a decoded value can hold a `[]const u8` view into
+    your buffer with no copy.
+  - **`feed` (streaming, chunk by chunk):** a delivered slice is **valid only
+    during that callback** — copy it out to keep it. It usually points into the
+    chunk you just fed, but a payload that straddled a chunk boundary is
+    stitched together in `IStream`'s internal carry buffer and delivered as a
+    slice into *that*, which the next stitched item overwrites. Do not assume a
+    `feed`-delivered slice lives in your own chunk.
 
 | Buffer | Owner / lifetime |
 |--------|------------------|
 | **Output buffer** | Caller-owned `[]u8`; library never allocates or grows it (no sink → `error.BufferFull`). |
-| **Input buffer** | Caller-owned; must outlive the call; string/blob slices borrow from it during the callback. |
+| **Input buffer (`decode`)** | Caller-owned; must outlive the call. Delivered string/blob slices borrow from it and stay valid for its whole lifetime — retainable, not callback-scoped. |
+| **Input chunk (`feed`)** | Caller-owned; must outlive the call. Delivered string/blob slices are valid only during the callback; a carry-completed payload borrows from `IStream`, not from your chunk. |
 
 This is a **push / visitor** model, so there is no address-stability requirement
 on decoded values. The only memory the decoder owns is `IStream`'s fixed 64-byte
