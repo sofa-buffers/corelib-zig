@@ -26,6 +26,13 @@
 //!     pub fn signed(self: *@This(), id: sofab.Id, v: i64) void { ... }
 //!     pub fn fp32(self: *@This(), id: sofab.Id, v: f32) void { ... }
 //!     pub fn fp64(self: *@This(), id: sofab.Id, v: f64) void { ... }
+//!     // Announced once per fixlen field (string/blob/fp32/fp64) after its
+//!     // length word is read and validated and before any payload byte —
+//!     // `total == 0` included. `subtype` is the *arrived* fixlen kind. Unlike
+//!     // the other callbacks it may fail: raising rejects the field (INVALID),
+//!     // which is how a `maxlen` bound is latched at the length word regardless
+//!     // of where a chunk boundary falls. Optional, like every callback.
+//!     pub fn fixlenBegin(self: *@This(), id: sofab.Id, subtype: sofab.FixlenType, total: usize) sofab.Error!void { ... }
 //!     // string/blob chunks: `total` is the field length, `offset` the chunk
 //!     // position; a contiguous decode delivers one whole-payload chunk.
 //!     pub fn string(self: *@This(), id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void { ... }
@@ -298,6 +305,20 @@ pub const IStream = struct {
                         const subtype = try FixlenType.fromRaw(@truncate(word));
                         if (word >> 3 > types.FIXLEN_MAX) return Error.InvalidMessage;
                         const len: usize = @intCast(word >> 3);
+                        // Announce the field at its length word — before any
+                        // payload byte, `total == 0` included — so a visitor
+                        // enforcing a schema `maxlen` can latch INVALID here
+                        // even when the message ends exactly at the length word.
+                        // Without it the verdict would degrade to INCOMPLETE for
+                        // that truncation while the same bytes read whole are
+                        // INVALID — a chunk-boundary-dependent outcome §6.4/§7.2
+                        // forbid; INVALID must dominate INCOMPLETE (§5.2).
+                        // Raising from the callback is what rejects the field.
+                        // This mirrors `arrayBegin` for arrays one field kind
+                        // over; `@hasDecl` keeps it free for a visitor that does
+                        // not declare it (no vtable, no runtime branch).
+                        if (comptime @hasDecl(V, "fixlenBegin"))
+                            try visitor.fixlenBegin(id, subtype, len);
                         switch (subtype) {
                             .fp32, .fp64 => {
                                 const want: usize = if (subtype == .fp64) 8 else 4;
@@ -704,6 +725,73 @@ test "reserved fixlen subtypes and bad float lengths are rejected" {
     try testing.expectError(Error.InvalidMessage, decode(&.{ 0x02, 0x28, 0, 0, 0, 0, 0 }, &sink));
     // string/blob subtype in a fixlen array: count 1, word (1 << 3) | 2.
     try testing.expectError(Error.InvalidMessage, decode(&.{ 0x05, 0x01, 0x0A, 0x61 }, &sink));
+}
+
+// Records every fixlenBegin call and, if `maxlen` is set, rejects a field whose
+// declared length exceeds it — the schema-`maxlen` enforcement point.
+const FixlenAnnounce = struct {
+    calls: u32 = 0,
+    last_id: Id = 0,
+    last_subtype: FixlenType = .fp32,
+    last_total: usize = 0,
+    maxlen: usize = std.math.maxInt(usize),
+
+    pub fn fixlenBegin(self: *FixlenAnnounce, id: Id, subtype: FixlenType, total: usize) Error!void {
+        self.calls += 1;
+        self.last_id = id;
+        self.last_subtype = subtype;
+        self.last_total = total;
+        if (total > self.maxlen) return Error.InvalidMessage;
+    }
+};
+
+test "fixlenBegin fires at the length word (id/subtype/total, total 0 included)" {
+    // A zero-length string: header (3 << 3) | 2 = 0x1a, word (0 << 3) | 2 = 0x02.
+    var s0: FixlenAnnounce = .{};
+    try testing.expectEqual(Status.complete, try decode(&.{ 0x1a, 0x02 }, &s0));
+    try testing.expectEqual(@as(u32, 1), s0.calls);
+    try testing.expectEqual(@as(Id, 3), s0.last_id);
+    try testing.expectEqual(FixlenType.string, s0.last_subtype);
+    try testing.expectEqual(@as(usize, 0), s0.last_total);
+
+    // A blob carrying its length: header 0x1a, word (5 << 3) | 3 = 0x2b, then 5
+    // payload bytes. The subtype reported is what *arrived* (blob).
+    var b5: FixlenAnnounce = .{};
+    try testing.expectEqual(
+        Status.complete,
+        try decode(&.{ 0x1a, 0x2b, 1, 2, 3, 4, 5 }, &b5),
+    );
+    try testing.expectEqual(@as(u32, 1), b5.calls);
+    try testing.expectEqual(FixlenType.blob, b5.last_subtype);
+    try testing.expectEqual(@as(usize, 5), b5.last_total);
+}
+
+test "fixlenBegin latches maxlen INVALID at the length word, no payload byte needed" {
+    // The finding's shape: a single over-maxlen string field truncated to end
+    // exactly at its length word. header (3 << 3) | 2 = 0x1a, word (10 << 3) | 2
+    // = 0x52 — length 10, no payload. With a maxlen of 4 the field is INVALID,
+    // and that verdict must not depend on any payload byte arriving.
+    const over = [_]u8{ 0x1a, 0x52 };
+
+    // Whole, in one shot.
+    var whole: FixlenAnnounce = .{ .maxlen = 4 };
+    try testing.expectError(Error.InvalidMessage, decode(&over, &whole));
+    try testing.expectEqual(@as(u32, 1), whole.calls);
+
+    // One byte at a time — the length word only completes on the second feed,
+    // and INVALID must be raised there, never degrading to INCOMPLETE.
+    var chunked: FixlenAnnounce = .{ .maxlen = 4 };
+    var is = IStream.init();
+    try testing.expectEqual(Status.incomplete, try is.feed(over[0..1], &chunked));
+    try testing.expectError(Error.InvalidMessage, is.feed(over[1..2], &chunked));
+
+    // Control: the same truncation with a length inside the bound stays
+    // INCOMPLETE — this is an ordering fix, not a blanket reject. The callback
+    // still fires (the field was announced); it just does not raise.
+    var in_bound: FixlenAnnounce = .{ .maxlen = 64 };
+    try testing.expectEqual(Status.incomplete, try decode(&over, &in_bound));
+    try testing.expectEqual(@as(u32, 1), in_bound.calls);
+    try testing.expectEqual(@as(usize, 10), in_bound.last_total);
 }
 
 test "decoder reuse via reset" {
