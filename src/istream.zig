@@ -272,22 +272,14 @@ pub const IStream = struct {
                 const header = (try varint.readVarint(buf, &pos)) orelse return field_start;
                 const wire: u3 = @truncate(header);
                 const id_raw = header >> 3;
-
-                // §4.9/§6.2: the `ID_MAX` ceiling binds only *value-bearing*
-                // headers. A sequence-end (wire 7) discards its id, so it is
-                // exempt — accept any id, close the sequence, and let the
-                // encoder re-emit the marker as `0x07`. Handle it before the
-                // ceiling check and the `@intCast`, both of which would wrongly
-                // reject (or trap on) an over-`ID_MAX` end marker (F-0054). The
-                // 64-bit varint bound (§4.1) still applied when `header` was
-                // read, so the id remains bounded even without the ceiling.
-                if (wire == types.T_SEQUENCE_END) {
-                    if (self.depth == 0) return Error.InvalidMessage;
-                    self.depth -= 1;
-                    if (comptime @hasDecl(V, "sequenceEnd")) visitor.sequenceEnd();
-                    continue;
-                }
-
+                // §4.9/§6.2: `ID_MAX` binds the id of **every** field header
+                // without exception — the value-bearing ones and the
+                // sequence-end marker alike. That a sequence end's id is
+                // discarded rather than used (§4.9) does not exempt it; the
+                // ceiling is stated over headers, not over headers whose id a
+                // decoder happens to consult. One unconditional comparison,
+                // ahead of the wire-type dispatch, so no per-wire-type
+                // exception has to be carried through the decode path (F-0054).
                 if (id_raw > types.ID_MAX) return Error.InvalidMessage;
                 const id: Id = @intCast(id_raw);
 
@@ -393,9 +385,11 @@ pub const IStream = struct {
                         self.depth += 1;
                         if (comptime @hasDecl(V, "sequenceBegin")) visitor.sequenceBegin(id);
                     },
-                    // Handled above the ceiling check — its id is never
-                    // validated against `ID_MAX` (§4.9).
-                    types.T_SEQUENCE_END => unreachable,
+                    types.T_SEQUENCE_END => {
+                        if (self.depth == 0) return Error.InvalidMessage;
+                        self.depth -= 1;
+                        if (comptime @hasDecl(V, "sequenceEnd")) visitor.sequenceEnd();
+                    },
                 }
             }
         }
@@ -659,26 +653,32 @@ test "field id above ID_MAX is rejected" {
     try testing.expectError(Error.InvalidMessage, decode(&bytes, &sink));
 }
 
-test "over-ID_MAX id on a sequence-end is accepted and discarded (F-0054)" {
-    // §4.9/§6.2: the id of a sequence-end header is discarded, not bound by
-    // ID_MAX. Reproducer from the finding:
+test "ID_MAX binds a sequence-end id like any other header (F-0054)" {
+    // §4.9/§6.2: `ID_MAX` binds the id of *every* header, including the
+    // sequence-end marker whose id is discarded. This is Option B — the id's
+    // value is bounded, then discarded — not Option A, which exempted wire 7.
+    //
+    // Over-ceiling reproducer from the finding, which must be INVALID:
     //   76             — field id 14, wire 6 (SequenceStart): opens a sequence
     //   87 80 80 80 40 — wire 7 (SequenceEnd), id 2^31 (one past ID_MAX)
-    // The end marker must close the open sequence, not be rejected.
-    const bytes = [_]u8{ 0x76, 0x87, 0x80, 0x80, 0x80, 0x40 };
-    var p: Probe = .{};
-    try testing.expectEqual(Status.complete, try decode(&bytes, &p));
-    try testing.expectEqual(@as(u32, 1), p.begins);
-    try testing.expectEqual(@as(u32, 1), p.ends);
+    var bad_end: Probe = .{};
+    try testing.expectError(
+        Error.InvalidMessage,
+        decode(&.{ 0x76, 0x87, 0x80, 0x80, 0x80, 0x40 }, &bad_end),
+    );
 
-    // Controls that must keep passing: a sequence-end id below and exactly at
-    // ID_MAX also closes the sequence. Header = (id << 3) | 7.
-    // id 3:            (3 << 3) | 7 = 0x1F
-    var small: Probe = .{};
-    try testing.expectEqual(Status.complete, try decode(&.{ 0x0E, 0x1F }, &small));
-    try testing.expectEqual(@as(u32, 1), small.ends);
-    // id ID_MAX (2^31 - 1): header = ((2^31 - 1) << 3) | 7 = 2^34 - 1,
-    // encoded as 0xFF 0xFF 0xFF 0xFF 0x3F.
+    // The same over-ID_MAX id on a value-bearing (unsigned, wire 0) header is
+    // INVALID too — one unconditional rule, no per-wire-type branch. Header =
+    // (2^31 << 3) | 0 = 2^34, then a 0x00 value byte.
+    var bad_unsigned: Probe = .{};
+    try testing.expectError(
+        Error.InvalidMessage,
+        decode(&.{ 0x80, 0x80, 0x80, 0x80, 0x40, 0x00 }, &bad_unsigned),
+    );
+
+    // Boundary, separating Option B from both A and C. Header = (id << 3) | 7.
+    // id ID_MAX (2^31 - 1) accepts: ((2^31 - 1) << 3) | 7 = 2^34 - 1, encoded
+    // 0xFF 0xFF 0xFF 0xFF 0x3F.
     var at_max: Probe = .{};
     try testing.expectEqual(
         Status.complete,
@@ -686,14 +686,13 @@ test "over-ID_MAX id on a sequence-end is accepted and discarded (F-0054)" {
     );
     try testing.expectEqual(@as(u32, 1), at_max.ends);
 
-    // Sibling that must STAY rejected: the same over-ID_MAX id on a
-    // value-bearing (unsigned wire 0) header is INVALID (§6.2). Header =
-    // (2^31 << 3) | 0 = 2^34, then a 0x00 value byte.
-    var bad: Probe = .{};
-    try testing.expectError(
-        Error.InvalidMessage,
-        decode(&.{ 0x80, 0x80, 0x80, 0x80, 0x40, 0x00 }, &bad),
-    );
+    // A non-minimal spelling of an in-range id is still accepted and normalized
+    // (§4.1 untouched) — this is what rules out Option C. id 0 spelled in two
+    // bytes: 0x87 0x00 decodes to header 7 (wire 7, id 0). Opened by 0x0E.
+    var noncanon: Probe = .{};
+    try testing.expectEqual(Status.complete, try decode(&.{ 0x0E, 0x87, 0x00 }, &noncanon));
+    try testing.expectEqual(@as(u32, 1), noncanon.begins);
+    try testing.expectEqual(@as(u32, 1), noncanon.ends);
 }
 
 test "reserved fixlen subtypes and bad float lengths are rejected" {
