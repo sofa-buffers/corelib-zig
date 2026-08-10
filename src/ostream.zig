@@ -66,6 +66,20 @@ pub const OStream = struct {
     /// write on an inert stream reaches because its buffer has no capacity.
     dead: bool = false,
 
+    /// Set by `bufferSetChecked`, cleared around every sink call: whether the
+    /// callback **installed** a buffer before it returned (CORELIB_PLAN §5.1).
+    ///
+    /// This is what separates the copy-and-continue shape from
+    /// take-and-replace, and §5.1 has the callback state it rather than the
+    /// encoder infer it: returning *without* installing means the sink copied,
+    /// so the active buffer stays active and its cursor resumes at 0;
+    /// installing means the sink took the buffer, and the replacement's cursor
+    /// starts at *that call's* offset — the start offset belongs to the
+    /// installation, not to the buffer. A pointer comparison would not do:
+    /// passing the **same** buffer to `bufferSet` is a new installation like any
+    /// other, which is how a sink re-arms its header room in every flushed unit.
+    installed: bool = false,
+
     /// Whether `offset` names a position **in** `buffer`, which every
     /// installation requires, with a sink or without one. `offset == len` is in
     /// range — that is a buffer of capacity zero, which a sinkless stream may
@@ -148,15 +162,33 @@ pub const OStream = struct {
 
     /// Flush any pending bytes to the sink (if one is set) and report how many
     /// bytes were pending. With no sink the buffer is left intact.
+    ///
+    /// The sink may **take** the buffer instead of copying it, in which case it
+    /// installs a replacement before returning and the stream resumes in that
+    /// replacement, at the offset it was installed with (§5.1); see `callSink`.
     pub fn flush(self: *OStream) usize {
         const used = self.offset;
         if (used > 0) {
             if (self.flush_fn) |sink| {
-                sink(self.flush_ctx, self.buffer[0..used]);
-                self.offset = 0;
+                self.callSink(sink, used);
             }
         }
         return used;
+    }
+
+    /// Hand `used` buffered bytes to `sink` and resolve where the stream
+    /// continues (CORELIB_PLAN §5.1, "what a returning flush callback leaves
+    /// behind").
+    ///
+    /// The callback may install a buffer while it runs — that is how a taking
+    /// sink hands the storage on — so the installation it leaves behind is the
+    /// one that survives: only a sink that installed **nothing** copied, and
+    /// only for it does the cursor go back to 0. Installing consumes the
+    /// offset, so a later bare return still resumes at 0.
+    fn callSink(self: *OStream, sink: FlushFn, used: usize) void {
+        self.installed = false;
+        sink(self.flush_ctx, self.buffer[0..used]);
+        if (!self.installed) self.offset = 0;
     }
 
     /// Replace the active buffer (typically called from within a flush sink),
@@ -195,6 +227,10 @@ pub const OStream = struct {
         if (!ok) return Error.InvalidArgument;
         self.buffer = buffer;
         self.offset = offset;
+        // The installation is what a sink call reads back to tell take-and-
+        // replace from copy-and-continue; outside a sink call nothing reads it,
+        // and the next call clears it before the callback runs.
+        self.installed = true;
     }
 
     // --- primitives ---------------------------------------------------------
@@ -213,12 +249,15 @@ pub const OStream = struct {
     /// Also where an inert stream (a refused installation, §5.1) surfaces: it
     /// holds a zero-capacity buffer, so every write lands here before it can
     /// store anything, and `InvalidArgument` is reported instead of a flush.
+    /// A sink that refuses its own replacement kills the stream from inside the
+    /// callback, so the check is repeated on the way out: the caller must not
+    /// go on to store into the empty buffer a refusal leaves behind.
     fn drainFull(self: *OStream) Error!void {
         @branchHint(.cold);
         if (self.dead) return Error.InvalidArgument;
         const sink = self.flush_fn orelse return Error.BufferFull;
-        sink(self.flush_ctx, self.buffer[0..self.offset]);
-        self.offset = 0;
+        self.callSink(sink, self.offset);
+        if (self.dead) return Error.InvalidArgument;
     }
 
     /// Copy a raw byte slice out, draining the buffer as needed: a bulk
@@ -1194,4 +1233,158 @@ test "a refused mid-stream buffer-set leaves the stream inert (§5.1)" {
     try sinkless.bufferSetChecked(replacement[0..0], 0);
     try testing.expectError(Error.BufferFull, sinkless.writeUnsigned(1, 1));
     try testing.expectError(Error.InvalidArgument, sinkless.bufferSetChecked(&replacement, 3));
+}
+
+/// Drives the same short message through every §5.1 sink shape below: enough
+/// fields that a 16-byte buffer with a reservation flushes several times.
+fn reservedRoomOps(os: *OStream) Error!void {
+    var i: Id = 0;
+    while (i < 16) : (i += 1) try os.writeUnsigned(i, 1);
+}
+
+test "a taking sink's replacement keeps its own start offset (§5.1)" {
+    // The take-and-replace half of the returning-callback contract: the sink
+    // takes the buffer it was handed and installs a *different* one, with
+    // header room reserved, before returning. The start offset belongs to that
+    // installation, so every flushed unit — not only the first — begins with
+    // the bytes the sink reserved.
+    const reserve = 4;
+    const Taking = struct {
+        a: [16]u8 = @splat(0xEE),
+        b: [16]u8 = @splat(0xEE),
+        units: [8][16]u8 = undefined,
+        lens: [8]usize = @splat(0),
+        n: usize = 0,
+        os: *OStream = undefined,
+
+        fn push(ctx: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(self.units[self.n][0..data.len], data);
+            self.lens[self.n] = data.len;
+            self.n += 1;
+            // Taken, not copied: scrub the buffer we were handed so a store the
+            // encoder makes into it after we return shows up as garbage rather
+            // than as the bytes we already carried away.
+            const took_a = @intFromPtr(data.ptr) == @intFromPtr(&self.a);
+            const handed: *[16]u8 = if (took_a) &self.a else &self.b;
+            const fresh: *[16]u8 = if (took_a) &self.b else &self.a;
+            @memset(handed, 0xAA);
+            @memset(fresh, 0xEE);
+            self.os.bufferSet(fresh, reserve);
+        }
+    };
+
+    var one_shot_buf: [128]u8 = undefined;
+    const one_shot = try encoded(&one_shot_buf, reservedRoomOps);
+
+    var sink: Taking = .{};
+    var os = OStream.initFlush(&sink.a, reserve, &sink, Taking.push);
+    sink.os = &os;
+    try reservedRoomOps(&os);
+    _ = os.flush();
+
+    try testing.expect(sink.n >= 3); // several flushes, so the swap really runs
+    var joined: [128]u8 = undefined;
+    var len: usize = 0;
+    for (sink.units[0..sink.n], sink.lens[0..sink.n]) |unit, unit_len| {
+        // The reservation survived the return: the sink's own header room is
+        // still its own, in this unit as in the first.
+        try testing.expect(unit_len > reserve);
+        for (unit[0..reserve]) |b| try testing.expectEqual(@as(u8, 0xEE), b);
+        @memcpy(joined[len..][0 .. unit_len - reserve], unit[reserve..unit_len]);
+        len += unit_len - reserve;
+    }
+    // And the payload behind the reservations is the one-shot message.
+    try testing.expectEqualSlices(u8, one_shot, joined[0..len]);
+}
+
+test "re-installing the same buffer re-arms its reservation (§5.1)" {
+    // "Passing the same buffer to buffer-set is a new installation like any
+    // other" — that is how a copying sink gets fresh header room in every
+    // flushed unit, so the distinction cannot be drawn by comparing pointers.
+    const reserve = 3;
+    const Rearming = struct {
+        buf: [16]u8 = @splat(0xEE),
+        units: [8][16]u8 = undefined,
+        lens: [8]usize = @splat(0),
+        n: usize = 0,
+        os: *OStream = undefined,
+
+        fn push(ctx: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(self.units[self.n][0..data.len], data);
+            self.lens[self.n] = data.len;
+            self.n += 1;
+            @memset(&self.buf, 0xEE);
+            self.os.bufferSet(&self.buf, reserve);
+        }
+    };
+
+    var one_shot_buf: [128]u8 = undefined;
+    const one_shot = try encoded(&one_shot_buf, reservedRoomOps);
+
+    var sink: Rearming = .{};
+    var os = OStream.initFlush(&sink.buf, reserve, &sink, Rearming.push);
+    sink.os = &os;
+    try reservedRoomOps(&os);
+    _ = os.flush();
+
+    try testing.expect(sink.n >= 3);
+    var joined: [128]u8 = undefined;
+    var len: usize = 0;
+    for (sink.units[0..sink.n], sink.lens[0..sink.n]) |unit, unit_len| {
+        try testing.expect(unit_len > reserve);
+        for (unit[0..reserve]) |b| try testing.expectEqual(@as(u8, 0xEE), b);
+        @memcpy(joined[len..][0 .. unit_len - reserve], unit[reserve..unit_len]);
+        len += unit_len - reserve;
+    }
+    try testing.expectEqualSlices(u8, one_shot, joined[0..len]);
+}
+
+test "a copying sink that returns without installing resumes at 0 (§5.1)" {
+    // The other half of the contract, and the reason the distinction is a flag
+    // the callback sets rather than a property of the buffer: this sink
+    // installs nothing, so the offset it was installed with is consumed by the
+    // first flush and every later unit starts at 0.
+    var sink: CountingSink = .{};
+    var buf: [16]u8 = @splat(0xEE);
+    var os = OStream.initFlush(&buf, 4, &sink, CountingSink.push);
+    try reservedRoomOps(&os);
+    _ = os.flush();
+
+    var one_shot_buf: [128]u8 = undefined;
+    const one_shot = try encoded(&one_shot_buf, reservedRoomOps);
+    // One reservation, in the first unit only: the rest of the stream is the
+    // message, contiguous behind it.
+    try testing.expect(sink.calls >= 3);
+    for (sink.out[0..4]) |b| try testing.expectEqual(@as(u8, 0xEE), b);
+    try testing.expectEqualSlices(u8, one_shot, sink.out[4..sink.len]);
+}
+
+test "a replacement the sink cannot install leaves the stream inert (§5.1)" {
+    // The refusal rule does not soften inside a callback: a sink that installs
+    // an unusable replacement kills the stream there, and the write that
+    // triggered the flush reports it instead of storing into the buffer that
+    // was refused.
+    const BadTaker = struct {
+        buf: [16]u8 = undefined,
+        replacement: [8]u8 = @splat(0x55),
+        calls: usize = 0,
+        os: *OStream = undefined,
+
+        fn push(ctx: ?*anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            // No usable bytes behind the offset: below MIN_OUTPUT_BUFFER.
+            self.os.bufferSet(&self.replacement, self.replacement.len);
+        }
+    };
+
+    var sink: BadTaker = .{};
+    var os = OStream.initFlush(&sink.buf, 0, &sink, BadTaker.push);
+    sink.os = &os;
+    try testing.expectError(Error.InvalidArgument, reservedRoomOps(&os));
+    try testing.expectEqual(@as(usize, 1), sink.calls);
+    try testing.expectError(Error.InvalidArgument, os.writeUnsigned(1, 1));
+    for (sink.replacement) |b| try testing.expectEqual(@as(u8, 0x55), b);
 }

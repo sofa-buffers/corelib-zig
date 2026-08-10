@@ -207,6 +207,71 @@ fn chunkedEncode(arena: std.mem.Allocator, fields: []const std.json.Value, buf_s
     return copy;
 }
 
+/// Fill of the framing room a taking sink reserves in every unit; any byte of a
+/// reservation the encoder overwrote reads as something else.
+const reserved_fill: u8 = 0xEE;
+
+/// Byte sink for the take-and-replace scenario (CORELIB_PLAN §5.1): it *takes*
+/// the buffer it was handed — scrubbing it, so a store the encoder makes into
+/// it after the return shows up as garbage rather than as the bytes already
+/// carried away — and installs the other of two scratch buffers with framing
+/// room reserved before returning. The start offset belongs to that
+/// installation, so **every** unit begins with its own reservation and the
+/// message is what follows the reservations, concatenated.
+const TakingCollector = struct {
+    a: [16]u8 = @splat(reserved_fill),
+    b: [16]u8 = @splat(reserved_fill),
+    buf_size: usize,
+    reserve: usize,
+    data: [8192]u8 = undefined,
+    len: usize = 0,
+    units: usize = 0,
+    reservations_intact: bool = true,
+    os: *sofab.OStream = undefined,
+
+    fn push(ctx: ?*anyopaque, chunk: []const u8) void {
+        const self: *TakingCollector = @ptrCast(@alignCast(ctx.?));
+        self.units += 1;
+        if (chunk.len < self.reserve) {
+            self.reservations_intact = false;
+        } else {
+            for (chunk[0..self.reserve]) |b| {
+                if (b != reserved_fill) self.reservations_intact = false;
+            }
+            const payload = chunk[self.reserve..];
+            @memcpy(self.data[self.len..][0..payload.len], payload);
+            self.len += payload.len;
+        }
+
+        const took_a = @intFromPtr(chunk.ptr) == @intFromPtr(&self.a);
+        const handed: *[16]u8 = if (took_a) &self.a else &self.b;
+        const fresh: *[16]u8 = if (took_a) &self.b else &self.a;
+        @memset(handed, 0xAA);
+        @memset(fresh, reserved_fill);
+        self.os.bufferSet(fresh[0..self.buf_size], self.reserve);
+    }
+};
+
+/// Encode `fields[]` through a taking sink that hands the encoder a fresh
+/// buffer with `reserve` bytes of framing room on every flush, and return the
+/// payload behind the reservations.
+fn takingEncode(
+    arena: std.mem.Allocator,
+    fields: []const std.json.Value,
+    buf_size: usize,
+    reserve: usize,
+) ![]const u8 {
+    var out: TakingCollector = .{ .buf_size = buf_size, .reserve = reserve };
+    var os = sofab.OStream.initFlush(out.a[0..buf_size], reserve, &out, TakingCollector.push);
+    out.os = &os;
+    try writeFields(&os, arena, fields);
+    _ = os.flush();
+    try std.testing.expect(out.reservations_intact);
+    const copy = arena.alloc(u8, out.len) catch @panic("oom");
+    @memcpy(copy, out.data[0..out.len]);
+    return copy;
+}
+
 // --- expected decode events -----------------------------------------------------
 
 fn arrayKind(et: []const u8) sofab.ArrayKind {
@@ -363,6 +428,18 @@ test "all shared vectors conform (encode, chunked-encode, decode, chunked-decode
         // 2. Chunked encode: stream out through tiny flush buffers.
         for ([_]usize{ 1, 3, 7 }) |bs| {
             try std.testing.expectEqualSlices(u8, expected_bytes, try chunkedEncode(arena, fields, bs));
+        }
+
+        // 2b. Take-and-replace encode (§5.1): the sink takes each buffer and
+        // installs a replacement with framing room reserved, so every flushed
+        // unit carries its own reservation and the payload behind them is the
+        // same message.
+        for ([_][2]usize{ .{ 2, 1 }, .{ 8, 3 } }) |cfg| {
+            try std.testing.expectEqualSlices(
+                u8,
+                expected_bytes,
+                try takingEncode(arena, fields, cfg[0], cfg[1]),
+            );
         }
 
         // 3. Vector decode: feed the official bytes, recovered fields must match.

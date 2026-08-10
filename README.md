@@ -328,6 +328,22 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
   `initOffsetChecked` / `initFlushChecked` / `bufferSetChecked` are the same
   installations reported as an error status up front, for a buffer or offset
   computed at runtime.
+  **What the flush callback does before it returns decides where the encoder
+  goes on writing.** A sink may *copy* the bytes it was handed or *take* the
+  buffer — hand it to a transport, queue it for an asynchronous write — and the
+  encoder cannot tell the two apart, so the callback states which it is:
+  returning **without** installing a buffer means it copied, and the active
+  buffer stays active with the cursor back at **0**; a sink that **takes** the
+  buffer must `bufferSet` a replacement before returning. The start offset
+  belongs to that installation, not to the buffer, so the encoder resumes at
+  *that call's* offset — `os.bufferSet(fresh, 4)` re-arms four bytes of header
+  room in the next flushed unit. Installing the **same** buffer is a new
+  installation like any other: that is how a sink gets fresh framing room in
+  **every** unit, one header per packet, where a bare return would give it only
+  in the first. The offset is consumed by the installation, so a later bare
+  return resumes at 0 again. A replacement refused inside a callback leaves the
+  stream inert like any other refusal, and the write that triggered the flush
+  reports `error.InvalidArgument` instead of storing into it.
   The struct itself is 1080 bytes on a 64-bit target: it reserves the full
   `MAX_DEPTH` lazy sequence hold-back run inline (see
   [Serialize](#serialize)), which is what buys canonical framing at every depth
