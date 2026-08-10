@@ -46,6 +46,7 @@ pub const API_VERSION = types.API_VERSION;
 pub const Id = types.Id;
 pub const ID_MAX = types.ID_MAX;
 pub const MAX_DEPTH = types.MAX_DEPTH;
+pub const MIN_OUTPUT_BUFFER = types.MIN_OUTPUT_BUFFER;
 pub const Unsigned = types.Unsigned;
 pub const Signed = types.Signed;
 pub const Error = types.Error;

@@ -61,8 +61,11 @@ test "roundtrip: one-shot encode equals chunked encode, one-shot decode equals c
     try std.testing.expect(message.len > 100);
 
     // Chunked encode through buffers far smaller than the message: the
-    // concatenated flush output must be byte-identical (§7.2 item 4).
-    for ([_]usize{ 1, 2, 5, 16 }) |bs| {
+    // concatenated flush output must be byte-identical (§7.2 item 4). The first
+    // size is the port's own declared `MIN_OUTPUT_BUFFER` — the size that proves
+    // the constant is real — and the message carries a string far longer than
+    // any of these buffers, so the divisible-run path is exercised too (§5.1).
+    for ([_]usize{ sofab.MIN_OUTPUT_BUFFER, 2, 5, 16 }) |bs| {
         const Collector = struct {
             data: [1024]u8 = undefined,
             len: usize = 0,

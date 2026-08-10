@@ -48,7 +48,7 @@ pub const OStream = struct {
     /// encoders that disagree about it disagree about *bytes*. This port keeps
     /// its allocation-free contract instead and reserves the run inline,
     /// `MAX_DEPTH` entries, which is why an `OStream` is a kilobyte-sized value
-    /// (1072 bytes on a 64-bit target). `depth` is checked against `MAX_DEPTH`
+    /// (1080 bytes on a 64-bit target). `depth` is checked against `MAX_DEPTH`
     /// before a push and `npending <= depth` always holds, so the array cannot
     /// overflow.
     pending: [types.MAX_DEPTH]Id = undefined,
@@ -57,23 +57,87 @@ pub const OStream = struct {
     /// `null` means "no sink": a full buffer is an error rather than a flush.
     flush_fn: ?FlushFn = null,
     flush_ctx: ?*anyopaque = null,
+    /// Set when an installation was **refused** (CORELIB_PLAN §5.1): an offset
+    /// outside the buffer, or fewer than `MIN_OUTPUT_BUFFER` usable bytes behind
+    /// a flush sink. The stream is then inert — it holds an empty slice of the
+    /// buffer it refused, so no write can reach memory, and every write reports
+    /// `error.InvalidArgument` instead. Reading it costs nothing on the hot
+    /// path: the only place that consults it is the cold drain, which every
+    /// write on an inert stream reaches because its buffer has no capacity.
+    dead: bool = false,
+
+    /// Whether `offset` names a position **in** `buffer`, which every
+    /// installation requires, with a sink or without one. `offset == len` is in
+    /// range — that is a buffer of capacity zero, which a sinkless stream may
+    /// hold (the first write reports `error.BufferFull`). Past the end it names
+    /// no installation at all, and §5.1's minimum — waived without a sink — has
+    /// nothing to say about it either way.
+    fn offsetInRange(len: usize, offset: usize) bool {
+        return offset <= len;
+    }
+
+    /// Whether `buffer` may be installed **with a sink**: its usable capacity
+    /// must reach `MIN_OUTPUT_BUFFER` (CORELIB_PLAN §5.1). An offset past the
+    /// end is folded in — it leaves no capacity at all.
+    fn streamingCapacityOk(len: usize, offset: usize) bool {
+        return offsetInRange(len, offset) and len - offset >= types.MIN_OUTPUT_BUFFER;
+    }
+
+    /// The stream a refused installation leaves behind: no capacity, nothing
+    /// written, every write `error.InvalidArgument`.
+    fn refused(buffer: []u8, ctx: ?*anyopaque, flush_fn: ?FlushFn) OStream {
+        return .{ .buffer = buffer[0..0], .offset = 0, .flush_fn = flush_fn, .flush_ctx = ctx, .dead = true };
+    }
 
     /// Create an encoder over `buffer` with no flush sink. Writing past the
     /// end of the buffer returns `error.BufferFull`.
+    ///
+    /// No sink, and the cursor starts at `0`, so there is nothing to refuse:
+    /// `MIN_OUTPUT_BUFFER` does not bind a buffer installed without a sink
+    /// (§5.1) and even an empty buffer is a legal installation — the first
+    /// write reports `error.BufferFull`.
     pub fn init(buffer: []u8) OStream {
         return .{ .buffer = buffer, .offset = 0 };
     }
 
     /// Like `init` but begin writing at `offset` bytes into the buffer,
     /// reserving space for a lower-layer protocol header.
+    ///
+    /// `offset` must name a position in `buffer` (`offset <= buffer.len`); an
+    /// offset past the end names no installation and is **refused where it is
+    /// handed over** (§5.1), leaving an inert stream whose every write reports
+    /// `error.InvalidArgument` and whose `bytesUsed()` is `0`. No sink is
+    /// attached, so `MIN_OUTPUT_BUFFER` does not bind here — the waiver is of
+    /// the *minimum*, not of the offset's range. Use `initOffsetChecked` to
+    /// take the refusal as an error status where the offset is computed.
     pub fn initOffset(buffer: []u8, offset: usize) OStream {
+        return initOffsetChecked(buffer, offset) catch refused(buffer, null, null);
+    }
+
+    /// `initOffset`, reporting the range precondition as an error status.
+    pub fn initOffsetChecked(buffer: []u8, offset: usize) Error!OStream {
+        if (!offsetInRange(buffer.len, offset)) return Error.InvalidArgument;
         return .{ .buffer = buffer, .offset = offset };
     }
 
     /// Create an encoder with a flush sink, starting at `offset`. When the
     /// buffer fills, the accumulated bytes are passed to `flush_fn` and
     /// writing resumes at the start of the buffer.
+    ///
+    /// A buffer installed **with** a sink must offer at least
+    /// `MIN_OUTPUT_BUFFER` usable bytes (`buffer.len - offset`, which an offset
+    /// past the end makes nonexistent). A smaller one is **refused here**, where
+    /// it is handed over, and never partway through a message (§5.1): the
+    /// returned stream is inert — it writes nothing and reports
+    /// `error.InvalidArgument` from every write. Use `initFlushChecked` to take
+    /// that refusal as an error status instead.
     pub fn initFlush(buffer: []u8, offset: usize, ctx: ?*anyopaque, flush_fn: FlushFn) OStream {
+        return initFlushChecked(buffer, offset, ctx, flush_fn) catch refused(buffer, ctx, flush_fn);
+    }
+
+    /// `initFlush`, reporting the capacity precondition as an error status.
+    pub fn initFlushChecked(buffer: []u8, offset: usize, ctx: ?*anyopaque, flush_fn: FlushFn) Error!OStream {
+        if (!streamingCapacityOk(buffer.len, offset)) return Error.InvalidArgument;
         return .{ .buffer = buffer, .offset = offset, .flush_fn = flush_fn, .flush_ctx = ctx };
     }
 
@@ -97,7 +161,38 @@ pub const OStream = struct {
 
     /// Replace the active buffer (typically called from within a flush sink),
     /// resuming writes at `offset` in the new buffer.
+    ///
+    /// A mid-stream buffer-set is an installation like any other, judged by the
+    /// same rule (§5.1): `offset` must name a position in `buffer`, and on a
+    /// stream **with** a sink the usable capacity must reach
+    /// `MIN_OUTPUT_BUFFER`. A replacement that fails either test is refused
+    /// **here**, at the hand-over, and leaves the stream inert rather than
+    /// writing on past the end of it: every later write reports
+    /// `error.InvalidArgument`. That is the only outcome a sink can be told
+    /// about, since a `FlushFn` returns no status; outside a sink,
+    /// `bufferSetChecked` reports the same refusal as an error status.
     pub fn bufferSet(self: *OStream, buffer: []u8, offset: usize) void {
+        self.bufferSetChecked(buffer, offset) catch {
+            self.buffer = buffer[0..0];
+            self.offset = 0;
+            self.dead = true;
+        };
+    }
+
+    /// `bufferSet`, reporting the installation preconditions as an error status.
+    /// A refused replacement is not installed and leaves the stream untouched.
+    ///
+    /// An inert stream — one a refused installation already killed — stays
+    /// inert: it is missing the writes it refused, so resuming it into a fresh
+    /// buffer would hand back a truncated message as if it were whole. Build a
+    /// new `OStream` instead.
+    pub fn bufferSetChecked(self: *OStream, buffer: []u8, offset: usize) Error!void {
+        if (self.dead) return Error.InvalidArgument;
+        const ok = if (self.flush_fn != null)
+            streamingCapacityOk(buffer.len, offset)
+        else
+            offsetInRange(buffer.len, offset);
+        if (!ok) return Error.InvalidArgument;
         self.buffer = buffer;
         self.offset = offset;
     }
@@ -114,8 +209,13 @@ pub const OStream = struct {
     }
 
     /// Cold path: the buffer is full — flush it or report `BufferFull`.
+    ///
+    /// Also where an inert stream (a refused installation, §5.1) surfaces: it
+    /// holds a zero-capacity buffer, so every write lands here before it can
+    /// store anything, and `InvalidArgument` is reported instead of a flush.
     fn drainFull(self: *OStream) Error!void {
         @branchHint(.cold);
+        if (self.dead) return Error.InvalidArgument;
         const sink = self.flush_fn orelse return Error.BufferFull;
         sink(self.flush_ctx, self.buffer[0..self.offset]);
         self.offset = 0;
@@ -955,4 +1055,143 @@ test "flush drains pending bytes and mid-stream buffer swap works" {
     try os.writeUnsigned(0, 127);
     _ = os.flush();
     try testing.expectEqualSlices(u8, &.{ 0x08, 0xAC, 0x02, 0x00, 0x7F }, sink.out[0..sink.len]);
+}
+
+// --- §5.1 buffer installation ------------------------------------------------
+
+/// Sink for the installation tests: records what it was handed, so a test can
+/// assert it was never called at all.
+const CountingSink = struct {
+    out: [128]u8 = undefined,
+    len: usize = 0,
+    calls: usize = 0,
+
+    fn push(ctx: ?*anyopaque, data: []const u8) void {
+        const self: *CountingSink = @ptrCast(@alignCast(ctx.?));
+        @memcpy(self.out[self.len..][0..data.len], data);
+        self.len += data.len;
+        self.calls += 1;
+    }
+};
+
+test "a sink-backed buffer below MIN_OUTPUT_BUFFER is refused at the hand-over (§5.1)" {
+    // One byte short of the minimum — for this port's declared `1`, a buffer
+    // with zero usable bytes. It must be refused where it is handed over, never
+    // partway through a message, and it must not write a single byte: the
+    // surrounding guard bytes prove no store escaped the (empty) slice.
+    var guard: [16]u8 = @splat(0x11);
+    var sink: CountingSink = .{};
+
+    var os = OStream.initFlush(guard[8..8], 0, &sink, CountingSink.push);
+    try testing.expectError(Error.InvalidArgument, os.writeUnsigned(1, 1));
+    try testing.expectError(Error.InvalidArgument, os.writeString(2, "abc"));
+    try testing.expectEqual(@as(usize, 0), os.bytesUsed());
+    try testing.expectEqual(@as(usize, 0), os.flush());
+    try testing.expectEqual(@as(usize, 0), sink.calls);
+    for (guard) |b| try testing.expectEqual(@as(u8, 0x11), b);
+
+    // The same refusal as an error status, and the same for a non-empty buffer
+    // whose *offset* leaves less than the minimum behind it.
+    try testing.expectError(
+        Error.InvalidArgument,
+        OStream.initFlushChecked(guard[8..8], 0, &sink, CountingSink.push),
+    );
+    try testing.expectError(
+        Error.InvalidArgument,
+        OStream.initFlushChecked(&guard, guard.len, &sink, CountingSink.push),
+    );
+    // Exactly the minimum is accepted.
+    _ = try OStream.initFlushChecked(&guard, guard.len - types.MIN_OUTPUT_BUFFER, &sink, CountingSink.push);
+}
+
+test "a start offset past the end is refused at the hand-over (§5.1)" {
+    var guard: [8]u8 = @splat(0x22);
+
+    var os = OStream.initOffset(&guard, 100);
+    try testing.expectError(Error.InvalidArgument, os.writeUnsigned(1, 1));
+    try testing.expectEqual(@as(usize, 0), os.bytesUsed());
+    for (guard) |b| try testing.expectEqual(@as(u8, 0x22), b);
+
+    try testing.expectError(Error.InvalidArgument, OStream.initOffsetChecked(&guard, 100));
+    // `offset == len` is in range: a capacity of zero, legal without a sink.
+    var edge = try OStream.initOffsetChecked(&guard, guard.len);
+    try testing.expectError(Error.BufferFull, edge.writeUnsigned(1, 1));
+}
+
+test "the minimum binds only a buffer installed with a sink (§5.1)" {
+    // The converse of the rejection above: the very buffer a sink cannot have —
+    // zero usable bytes — is a legal installation *without* one, and a message
+    // that fits in it encodes. A sequence closed contentless is exactly that
+    // message: it occupies no bytes at all (MESSAGE_SPEC §2).
+    var buf: [4]u8 = @splat(0x33);
+    var os = OStream.init(buf[0..0]);
+    try os.writeSequenceBeginLazy(1);
+    try os.writeSequenceEnd();
+    try testing.expectEqual(@as(usize, 0), os.bytesUsed());
+    // A field does not fit, and says so with BufferFull — the sinkless
+    // overflow — not with the installation refusal.
+    try testing.expectError(Error.BufferFull, os.writeUnsigned(1, 1));
+    for (buf) |b| try testing.expectEqual(@as(u8, 0x33), b);
+
+    // And the minimum is no floor on a one-shot buffer either: a two-byte
+    // message still encodes into exactly two bytes.
+    var exact: [2]u8 = undefined;
+    var os2 = OStream.init(&exact);
+    try os2.writeUnsigned(0, 127);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x7F }, exact[0..os2.bytesUsed()]);
+}
+
+test "a buffer of exactly MIN_OUTPUT_BUFFER streams the one-shot bytes (§5.1)" {
+    const ops = struct {
+        fn f(os: *OStream) Error!void {
+            try os.writeUnsigned(1, 300);
+            // A payload run far longer than the buffer: the divisible-run path.
+            try os.writeString(2, "sofabuffers streams through one byte at a time");
+            try os.writeArrayUnsigned(3, &[_]u32{ 1, 128, 70000 });
+            try os.writeFp64(4, 1.5);
+        }
+    }.f;
+
+    var one_shot_buf: [128]u8 = undefined;
+    const one_shot = try encoded(&one_shot_buf, ops);
+
+    var sink: CountingSink = .{};
+    var tiny: [types.MIN_OUTPUT_BUFFER]u8 = undefined;
+    var os = OStream.initFlush(&tiny, 0, &sink, CountingSink.push);
+    try ops(&os);
+    _ = os.flush();
+    try testing.expectEqualSlices(u8, one_shot, sink.out[0..sink.len]);
+}
+
+test "a refused mid-stream buffer-set leaves the stream inert (§5.1)" {
+    var sink: CountingSink = .{};
+    var buf: [8]u8 = undefined;
+    var os = OStream.initFlush(&buf, 0, &sink, CountingSink.push);
+    try os.writeUnsigned(1, 1);
+
+    // Refused as an error status: nothing is installed, the stream keeps
+    // writing into the buffer it already had.
+    var replacement: [2]u8 = @splat(0x44);
+    try testing.expectError(Error.InvalidArgument, os.bufferSetChecked(&replacement, 5));
+    try testing.expectError(Error.InvalidArgument, os.bufferSetChecked(replacement[0..0], 0));
+    try os.writeUnsigned(2, 2);
+    try testing.expectEqual(@as(usize, 4), os.bytesUsed());
+
+    // Refused at the hand-over a sink can only take one way: the stream goes
+    // inert instead of writing past the end of the replacement.
+    os.bufferSet(&replacement, 5);
+    try testing.expectError(Error.InvalidArgument, os.writeUnsigned(3, 3));
+    try testing.expectEqual(@as(usize, 0), os.bytesUsed());
+    for (replacement) |b| try testing.expectEqual(@as(u8, 0x44), b);
+    // An inert stream is not revived by a sound buffer: it is missing the
+    // writes it refused.
+    var fresh: [16]u8 = undefined;
+    try testing.expectError(Error.InvalidArgument, os.bufferSetChecked(&fresh, 0));
+
+    // Without a sink the minimum does not bind a replacement — only the range
+    // of its offset does.
+    var sinkless = OStream.init(&buf);
+    try sinkless.bufferSetChecked(replacement[0..0], 0);
+    try testing.expectError(Error.BufferFull, sinkless.writeUnsigned(1, 1));
+    try testing.expectError(Error.InvalidArgument, sinkless.bufferSetChecked(&replacement, 3));
 }

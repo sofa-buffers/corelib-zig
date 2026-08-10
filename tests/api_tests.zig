@@ -15,6 +15,46 @@ test "normative limits (§6.2)" {
     try std.testing.expectEqual(i64, sofab.Signed);
 }
 
+test "MIN_OUTPUT_BUFFER is declared and within the §5.1 ceiling" {
+    // The smallest buffer this port accepts for streaming has to be a number a
+    // caller can read off the API before sizing its buffer, and §5.1 caps any
+    // declaration at 20 — a header varint plus its value, which is also the
+    // smallest message a schema can bound.
+    try std.testing.expectEqual(usize, @TypeOf(sofab.MIN_OUTPUT_BUFFER));
+    try std.testing.expect(sofab.MIN_OUTPUT_BUFFER >= 1);
+    try std.testing.expect(sofab.MIN_OUTPUT_BUFFER <= 20);
+    // This port splits atomic units across a flush, so it declares the floor.
+    try std.testing.expectEqual(@as(usize, 1), sofab.MIN_OUTPUT_BUFFER);
+}
+
+test "the minimum binds a sink-backed installation and no other (§5.1)" {
+    const Sink = struct {
+        fn push(ctx: ?*anyopaque, chunk: []const u8) void {
+            _ = ctx;
+            _ = chunk;
+        }
+    };
+    var buf: [8]u8 = @splat(0xEE);
+
+    // One byte short of the minimum behind a sink: refused where the buffer is
+    // handed over, not partway through a message, and nothing is written.
+    try std.testing.expectError(
+        sofab.Error.InvalidArgument,
+        sofab.OStream.initFlushChecked(&buf, buf.len, null, Sink.push),
+    );
+    var refused = sofab.OStream.initFlush(&buf, buf.len, null, Sink.push);
+    try std.testing.expectError(sofab.Error.InvalidArgument, refused.writeUnsigned(1, 1));
+    try std.testing.expectEqual(@as(usize, 0), refused.bytesUsed());
+    for (buf) |b| try std.testing.expectEqual(@as(u8, 0xEE), b);
+
+    // The converse: the same buffer without a sink is accepted, and a message
+    // that fits encodes into it — the minimum is a streaming constant, never a
+    // floor on the one-shot path.
+    var small = sofab.OStream.init(buf[0..2]);
+    try small.writeUnsigned(0, 127);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x7F }, buf[0..small.bytesUsed()]);
+}
+
 test "error baseline (§6.3) is exposed" {
     // The canonical baseline codes must all be members of the error set.
     // UsageError is deliberately absent: it was declared and never returned, so
