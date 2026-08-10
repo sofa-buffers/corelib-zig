@@ -25,6 +25,23 @@ pub const ARRAY_MAX: u64 = 0x7FFF_FFFF;
 /// (`INT32_MAX`).
 pub const FIXLEN_MAX: u64 = 0x7FFF_FFFF;
 
+/// Smallest **streaming** output buffer the encoder accepts, in usable bytes
+/// (CORELIB_PLAN §5.1). This port splits every atomic unit across a flush — a
+/// field header, a `fixlen_word`, an element count, a scalar varint and a float
+/// payload all fall back to a byte-at-a-time writer that drains between bytes —
+/// so it declares the smallest value §5.1 admits. A caller therefore never has
+/// to reserve headroom: any non-empty buffer streams a message of any size, and
+/// the bytes are identical to the one-shot path.
+///
+/// **It binds a buffer installed together with a flush sink**, and only such a
+/// buffer: `buffer.len - offset >= MIN_OUTPUT_BUFFER` is checked where the
+/// buffer is handed over — `OStream.initFlush` / `OStream.bufferSet` and their
+/// `…Checked` forms — and never partway through a message. A buffer installed
+/// **without** a sink is subject to no minimum at all (no flush can occur, so
+/// no atomic unit can be split): it either holds the message or reports
+/// `error.BufferFull`, and a two-byte message still encodes into two bytes.
+pub const MIN_OUTPUT_BUFFER: usize = 1;
+
 /// Maximum nested-sequence depth. An encoder must not open more than this many
 /// nested sequences, and a decoder rejects a message that nests deeper with
 /// `error.InvalidMessage` (normative per the architecture spec, §6.2).

@@ -124,7 +124,7 @@ format's own nesting ceiling. There is no window past which this encoder gives
 up and frames eagerly, so a sequence closed contentless is omitted at *every*
 depth and the bytes are canonical everywhere (CORELIB_PLAN §6). The price is
 paid in the struct rather than on the heap — the run is reserved inline, 255
-ids, so an `OStream` value is 1072 bytes on a 64-bit target and still allocates
+ids, so an `OStream` value is 1080 bytes on a 64-bit target and still allocates
 nothing. Only a heap-free profile is allowed to bound the run instead, and then
 it must publish the bound, because two encoders that disagree about it disagree
 about bytes; this port has no bound to publish.
@@ -158,6 +158,12 @@ var os = sofab.OStream.initFlush(&scratch, 0, &out, Sink.push);
 for (0..1000) |i| try os.writeUnsigned(@intCast(i), i);
 _ = os.flush(); // push the tail
 ```
+
+The scratch buffer may be as small as **`sofab.MIN_OUTPUT_BUFFER` (1 byte)** —
+this encoder splits every atomic unit across a flush, so any non-empty buffer
+streams a message of any size and the bytes are identical to the one-shot path.
+That minimum binds a buffer installed **with** a sink, and only such a buffer;
+see [Memory handling](#memory-handling) for what happens to one below it.
 
 ### Deserialize
 
@@ -307,7 +313,22 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
   callback the buffer drains and is reused (`bufferSet` swaps in a fresh one),
   and `initOffset` reserves leading framing space. Each write copies its bytes
   into the buffer, so caller source strings/slices may be reused immediately.
-  The struct itself is 1072 bytes on a 64-bit target: it reserves the full
+  A sink is never handed memory other than the output buffer — this port does
+  not pass `string`/`blob` payloads through.
+  **`sofab.MIN_OUTPUT_BUFFER` is `1`:** the smallest buffer accepted **for
+  streaming**, i.e. one installed together with a flush sink, which must offer
+  at least that many usable bytes (`buffer.len - offset`). A buffer installed
+  **without** a sink is subject to no minimum — no flush can occur, so it either
+  holds the message or reports `error.BufferFull`, and a two-byte message
+  encodes into a two-byte buffer. Every installation is judged where the buffer
+  is handed over — `initOffset`, `initFlush`, `bufferSet` — never partway
+  through a message: an offset past the end of the buffer, or less than
+  `MIN_OUTPUT_BUFFER` behind a sink, is refused there and leaves the stream
+  inert, writing nothing and reporting `error.InvalidArgument` from every write.
+  `initOffsetChecked` / `initFlushChecked` / `bufferSetChecked` are the same
+  installations reported as an error status up front, for a buffer or offset
+  computed at runtime.
+  The struct itself is 1080 bytes on a 64-bit target: it reserves the full
   `MAX_DEPTH` lazy sequence hold-back run inline (see
   [Serialize](#serialize)), which is what buys canonical framing at every depth
   without an allocator. Put it wherever you would put a 1 KiB local.
@@ -330,7 +351,7 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
 
 | Buffer | Owner / lifetime |
 |--------|------------------|
-| **Output buffer** | Caller-owned `[]u8`; library never allocates or grows it (no sink → `error.BufferFull`). |
+| **Output buffer** | Caller-owned `[]u8`; library never allocates or grows it (no sink → `error.BufferFull`). With a sink it must offer at least `MIN_OUTPUT_BUFFER` = 1 usable byte, checked at every installation; without one, no minimum applies. |
 | **Input buffer (`decode`)** | Caller-owned; must outlive the call. Delivered string/blob slices borrow from it and stay valid for its whole lifetime — retainable, not callback-scoped. |
 | **Input chunk (`feed`)** | Caller-owned; must outlive the call. Delivered string/blob slices are valid only during the callback; a carry-completed payload borrows from `IStream`, not from your chunk. |
 
