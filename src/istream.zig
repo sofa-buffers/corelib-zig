@@ -82,11 +82,15 @@ const Resume = union(enum) {
     array_fix: struct { id: Id, fp64: bool, remaining: usize },
 };
 
-/// The decode outcome at the point the caller has run out of input, per the
-/// three distinct outcomes of MESSAGE_SPEC §7. The third outcome, INVALID, is
-/// not represented here: malformed bytes are rejected eagerly with
-/// `error.InvalidMessage` while `feed`/`parse` is still consuming them, so a
-/// `Status` is only ever produced for input that is well-formed so far.
+/// The decode outcome at the point the caller has run out of input — the three
+/// distinct outcomes of MESSAGE_SPEC §7 / CORELIB_PLAN §5.2.
+///
+/// `feed` and `decode` return only the two non-error outcomes: malformed bytes
+/// are rejected eagerly with `error.InvalidMessage` while `feed`/`parse` is
+/// still consuming them, which is how Zig spells a rejection. `.invalid` exists
+/// so that the read-only `status` accessor can report that same terminal verdict
+/// afterwards instead of claiming a stream the decoder has already rejected is
+/// `.complete`.
 pub const Status = enum {
     /// The bytes fed so far end exactly at a field boundary — a valid whole
     /// message (COMPLETE).
@@ -97,6 +101,12 @@ pub const Status = enum {
     /// and decides, from its own framing, whether a trailing `.incomplete` is a
     /// truncation failure or simply a short read.
     incomplete,
+    /// The bytes consumed so far are malformed regardless of what follows
+    /// (INVALID) — the decoder rejected them with `error.InvalidMessage` and
+    /// latched that verdict. Terminal: no continuation can clear it, only
+    /// `IStream.reset`. Returned by `status`, never by `feed`/`decode`, which
+    /// report this outcome as `error.InvalidMessage`.
+    invalid,
 };
 
 /// Streaming Sofab decoder. Reusable across messages via `reset`. Owns no
@@ -110,6 +120,12 @@ pub const IStream = struct {
     state: Resume = .none,
     /// Nested sequence depth, for balanced start/end validation.
     depth: u32 = 0,
+    /// Latched INVALID verdict. §5.2 calls that outcome **terminal** ("can more
+    /// bytes change it? — no"): once the consumed bytes are malformed, no
+    /// continuation can make them well-formed, so the decoder must not
+    /// resynchronize on whatever follows the malformed construct. `reset`
+    /// clears it.
+    invalid: bool = false,
 
     /// Create a fresh decoder ready to accept a new message.
     pub fn init() IStream {
@@ -118,6 +134,11 @@ pub const IStream = struct {
 
     /// Reset to the initial state so the decoder can be reused for a new
     /// message.
+    ///
+    /// This is also the **only** way out of a latched INVALID verdict (§5.2): a
+    /// decoder that has rejected its input keeps rejecting — every further
+    /// `feed` returns `error.InvalidMessage` and `status` reports `.invalid` —
+    /// until it is reset.
     pub fn reset(self: *IStream) void {
         self.* = .{};
     }
@@ -133,14 +154,30 @@ pub const IStream = struct {
     /// number of `feed` calls; the decoder keeps all state internally and
     /// suspends/resumes at any byte boundary. `status` re-queries the same value
     /// without feeding more bytes.
+    ///
+    /// `error.InvalidMessage` is **terminal for this decoder** (§5.2, "can more
+    /// bytes change it? — no"). Once a `feed` has reported it, every further
+    /// `feed` reports it again — a whole valid message, an empty end-of-input
+    /// probe and a truncated prefix alike — rather than resynchronizing on the
+    /// bytes that follow the malformed construct, and `status` reports
+    /// `.invalid`. Without that latch the verdict would depend on where the
+    /// chunk boundaries fell, which MESSAGE_SPEC §7.2 item 4 forbids: the same
+    /// bytes must decode to the same outcome fed whole or one byte at a time.
+    /// `reset` clears the latch and readies the decoder for a new message.
     pub fn feed(self: *IStream, chunk: []const u8, visitor: anytype) Error!Status {
+        if (self.invalid) return error.InvalidMessage;
+        // Latches the terminal verdict on every path out of `feed` and `parse`,
+        // including a visitor callback that rejects a field. (Spelled
+        // `error.X` rather than `Error.X` throughout this function: an
+        // `errdefer` with a payload capture only accepts the inferred form.)
+        errdefer |e| self.latch(e);
         var input = chunk;
         // Finish a small item carried from the previous chunk: stitch input
         // bytes onto it until it completes, then fall through to the direct
         // zero-copy path for the rest of the chunk.
         while (self.carry_len > 0 and input.len > 0) {
             const n = @min(CARRY_CAP - self.carry_len, input.len);
-            if (n == 0) return Error.InvalidMessage; // cannot happen: items are < CARRY_CAP
+            if (n == 0) return error.InvalidMessage; // cannot happen: items are < CARRY_CAP
             @memcpy(self.carry[self.carry_len..][0..n], input[0..n]);
             self.carry_len += n;
             input = input[n..];
@@ -166,6 +203,18 @@ pub const IStream = struct {
         return self.status();
     }
 
+    /// Record a terminal INVALID verdict, so every later `feed` repeats it.
+    ///
+    /// Only `error.InvalidMessage` latches: it is the one outcome §5.2 calls
+    /// terminal. A receiver-side `error.LimitExceeded` raised by a visitor
+    /// callback (§6.2.1) is a policy rejection about **well-formed** bytes and
+    /// must not poison the decoder, and the other codes cannot reach a decode
+    /// path at all.
+    fn latch(self: *IStream, e: Error) void {
+        @branchHint(.cold);
+        if (e == Error.InvalidMessage) self.invalid = true;
+    }
+
     /// Report the decoder's outcome at the point the caller has run out of
     /// input (MESSAGE_SPEC §7), as a pure read-only accessor — it never mutates
     /// the decoder and never turns an incomplete decode into an error. `feed`
@@ -182,10 +231,13 @@ pub const IStream = struct {
     ///   still open (`depth != 0`). The caller — which owns end-of-input —
     ///   decides from its own framing whether a trailing `.incomplete` is a
     ///   truncation error or simply a short read.
-    ///
-    /// Genuinely-malformed input never reaches here: it is rejected with
-    /// `error.InvalidMessage` while `feed`/`parse` is still consuming bytes.
+    /// * `.invalid` once `feed` has rejected the consumed bytes with
+    ///   `error.InvalidMessage`. That verdict is terminal (§5.2), so it
+    ///   dominates the other two here as well: a decoder that has declared its
+    ///   input malformed never reports `.complete` or `.incomplete` again until
+    ///   `reset`.
     pub fn status(self: *const IStream) Status {
+        if (self.invalid) return .invalid;
         return if (self.carry_len != 0 or self.state != .none or self.depth != 0)
             .incomplete
         else
@@ -792,6 +844,46 @@ test "fixlenBegin latches maxlen INVALID at the length word, no payload byte nee
     try testing.expectEqual(Status.incomplete, try decode(&over, &in_bound));
     try testing.expectEqual(@as(u32, 1), in_bound.calls);
     try testing.expectEqual(@as(usize, 10), in_bound.last_total);
+}
+
+test "an INVALID verdict latches: later feeds repeat it and status reports it" {
+    // §5.2 marks INVALID terminal ("can more bytes change it? — no"): after a
+    // rejection the decoder must not resynchronize on the bytes that follow the
+    // malformed construct, and `status` must not claim `.complete` for a stream
+    // it has already declared malformed.
+    var p: Probe = .{};
+    var is = IStream.init();
+    try testing.expectError(Error.InvalidMessage, is.feed(&.{0x07}, &p)); // dangling end
+    try testing.expectEqual(Status.invalid, is.status());
+
+    // A well-formed field after the rejection: neither decoded nor accepted.
+    try testing.expectError(Error.InvalidMessage, is.feed(&.{ 0x00, 0x2A }, &p));
+    try testing.expectEqual(Status.invalid, is.status());
+    try testing.expectEqual(@as(u64, 0), p.unsigned_sum);
+
+    // An empty end-of-input probe does not clear it either.
+    try testing.expectError(Error.InvalidMessage, is.feed(&.{}, &p));
+    try testing.expectEqual(Status.invalid, is.status());
+
+    // `reset` is the documented way out.
+    is.reset();
+    try testing.expectEqual(Status.complete, try is.feed(&.{ 0x00, 0x2A }, &p));
+    try testing.expectEqual(@as(u64, 42), p.unsigned_sum);
+}
+
+test "a receiver-side LimitExceeded is policy, not malformation: it does not latch" {
+    // §6.2.1/§6.3: a receiver limit says nothing about the bytes' validity, so
+    // it must not poison the decoder the way INVALID does. Only INVALID latches.
+    const Limiter = struct {
+        pub fn fixlenBegin(_: *@This(), _: Id, _: FixlenType, _: usize) Error!void {
+            return Error.LimitExceeded;
+        }
+    };
+    var lim: Limiter = .{};
+    var is = IStream.init();
+    // header (3 << 3) | 2 = 0x1a, word (10 << 3) | 2 = 0x52 — a 10-byte string.
+    try testing.expectError(Error.LimitExceeded, is.feed(&.{ 0x1a, 0x52 }, &lim));
+    try testing.expect(is.status() != .invalid);
 }
 
 test "decoder reuse via reset" {

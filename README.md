@@ -223,8 +223,21 @@ while (transport.nextChunk()) |chunk| { // 7 bytes at a time, or 1, or 64k
 switch (status) { // == is.status()
     .complete => {},
     .incomplete => {}, // stream ended mid-message: your framing decides
+    .invalid => {},    // unreachable after a `try` — see below
 }
 ```
+
+**A rejection is terminal.** `error.InvalidMessage` means the consumed bytes are
+malformed *regardless of what follows* (CORELIB_PLAN §5.2), so the decoder
+latches that verdict instead of resynchronizing on whatever comes after the
+malformed construct: every further `feed` — a whole valid message, a truncated
+prefix and an empty end-of-input probe alike — returns `error.InvalidMessage`
+again, and `status()` reports the third `Status`, `.invalid`. That is the only
+way `.invalid` is ever observed, since `feed`/`decode` surface the outcome as the
+error itself. Without the latch the verdict would depend on where the chunk
+boundaries happened to fall — the same bytes must decode to the same outcome fed
+whole or one byte at a time (MESSAGE_SPEC §7.2). `is.reset()` clears the latch —
+it is the only way out — and readies the decoder for the next message.
 
 The error set also carries `error.LimitExceeded`, for a **receiver-configured**
 decode limit on an unbounded field (`max_dyn_array_count`, `max_dyn_string_len`,
