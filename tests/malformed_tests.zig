@@ -18,6 +18,7 @@ fn expectInvalidWholeAndChunked(bytes: []const u8) !void {
     var sink: Nothing = .{};
     var is = sofab.IStream.init();
     try std.testing.expectError(error.InvalidMessage, is.feed(bytes, &sink));
+    try expectTerminal(&is, &sink);
 
     // One byte at a time: the same error must surface, at whichever feed
     // completes (or ends) the malformed item.
@@ -28,6 +29,20 @@ fn expectInvalidWholeAndChunked(bytes: []const u8) !void {
         break :blk is2.status();
     };
     try std.testing.expectError(error.InvalidMessage, chunked);
+    try expectTerminal(&is2, &sink2);
+}
+
+/// A decoder that has reported INVALID stays there: §5.2 answers "can more bytes
+/// change it?" with "no — terminal", so every later `feed` repeats the rejection
+/// and `status` keeps reporting `.invalid` instead of resynchronizing on the
+/// bytes that follow the malformed construct.
+fn expectTerminal(is: *sofab.IStream, sink: anytype) !void {
+    try std.testing.expectEqual(sofab.Status.invalid, is.status());
+    // A well-formed field after the rejection must not be decoded.
+    try std.testing.expectError(error.InvalidMessage, is.feed(&.{ 0x00, 0x2A }, sink));
+    // Not even an empty end-of-input probe re-opens the decoder.
+    try std.testing.expectError(error.InvalidMessage, is.feed(&.{}, sink));
+    try std.testing.expectEqual(sofab.Status.invalid, is.status());
 }
 
 fn expectIncompleteWholeAndChunked(bytes: []const u8) !void {
@@ -159,4 +174,75 @@ test "decoder survives malformed input after valid fields (resync check)" {
         &.{.{ .unsigned = .{ .id = 1, .value = 42 } }},
         rec.events.items,
     );
+}
+
+test "an INVALID verdict is terminal: no resync onto the following bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A dangling sequence end (0x07) is malformed regardless of what follows,
+    // so the decoder is done: the perfectly valid field after it (id 0,
+    // unsigned 42) must never reach the visitor, and neither `feed` nor
+    // `status` may ever again report `.complete` for this stream (§5.2).
+    var rec = common.Recorder.init(arena);
+    var is = sofab.IStream.init();
+    try std.testing.expectError(error.InvalidMessage, is.feed(&.{0x07}, &rec));
+    try std.testing.expectEqual(sofab.Status.invalid, is.status());
+    try std.testing.expectError(error.InvalidMessage, is.feed(&.{ 0x00, 0x2A }, &rec));
+    try std.testing.expectEqual(sofab.Status.invalid, is.status());
+    try std.testing.expectEqual(@as(usize, 0), rec.events.items.len);
+
+    // Chunk-independence (MESSAGE_SPEC §7.2 item 4): the same bytes fed whole
+    // give the same verdict, and no field either.
+    var whole = common.Recorder.init(arena);
+    try std.testing.expectError(
+        error.InvalidMessage,
+        sofab.decode(&.{ 0x07, 0x00, 0x2A }, &whole),
+    );
+    try std.testing.expectEqual(@as(usize, 0), whole.events.items.len);
+
+    // `reset` is the only way out of the latch: afterwards the decoder is fresh
+    // and decodes the very message it just refused to resynchronize onto.
+    is.reset();
+    try std.testing.expectEqual(sofab.Status.complete, try is.feed(&.{ 0x00, 0x2A }, &rec));
+    try std.testing.expectEqual(sofab.Status.complete, is.status());
+    try common.expectEventsEqual(
+        &.{.{ .unsigned = .{ .id = 0, .value = 42 } }},
+        rec.events.items,
+    );
+}
+
+test "a latched INVALID survives mid-item and mid-payload state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Rejected while a string payload is still in flight: header (1 << 3) | 2 =
+    // 0x0a, word (4 << 3) | 2 = 0x22, two of the four payload bytes, then a
+    // dangling sequence end once the payload completes.
+    var rec = common.Recorder.init(arena);
+    var is = sofab.IStream.init();
+    try std.testing.expectEqual(sofab.Status.incomplete, try is.feed(&.{ 0x0a, 0x22, 'a', 'b' }, &rec));
+    try std.testing.expectError(error.InvalidMessage, is.feed(&.{ 'c', 'd', 0x07 }, &rec));
+    // The string itself was well-formed and stays delivered; what must not
+    // happen is decoding anything after the rejection.
+    try std.testing.expectEqual(sofab.Status.invalid, is.status());
+    try std.testing.expectError(error.InvalidMessage, is.feed(&.{ 0x00, 0x2A }, &rec));
+    try common.expectEventsEqual(
+        &.{.{ .str = .{ .id = 1, .data = "abcd" } }},
+        rec.events.items,
+    );
+
+    // Rejected with a half-read item in the carry buffer: a >64-bit varint
+    // header split across two feeds. The carry must not be re-parsed as a fresh
+    // field once more bytes arrive.
+    var rec2 = common.Recorder.init(arena);
+    var is2 = sofab.IStream.init();
+    const overlong: [11]u8 = @splat(0xFF);
+    try std.testing.expectEqual(sofab.Status.incomplete, try is2.feed(overlong[0..5], &rec2));
+    try std.testing.expectError(error.InvalidMessage, is2.feed(overlong[5..], &rec2));
+    try std.testing.expectEqual(sofab.Status.invalid, is2.status());
+    try std.testing.expectError(error.InvalidMessage, is2.feed(&.{ 0x00, 0x2A }, &rec2));
+    try std.testing.expectEqual(@as(usize, 0), rec2.events.items.len);
 }
