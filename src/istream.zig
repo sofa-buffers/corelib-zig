@@ -33,7 +33,8 @@
 //!     pub fn fp64(self: *@This(), id: sofab.Id, v: f64) void { ... }
 //!     // Announced once per fixlen field (string/blob/fp32/fp64) after its
 //!     // length word is read and validated and before any payload byte —
-//!     // `total == 0` included. `subtype` is the *arrived* fixlen kind. Unlike
+//!     // `total == 0` included, and exactly once however the input is chunked.
+//!     // `subtype` is the *arrived* fixlen kind. Unlike
 //!     // the other callbacks it may fail: raising rejects the field (INVALID),
 //!     // which is how a `maxlen` bound is latched at the length word regardless
 //!     // of where a chunk boundary falls. Optional, like every callback.
@@ -407,6 +408,28 @@ pub const IStream = struct {
                         const subtype = try FixlenType.fromRaw(@truncate(word));
                         if (word >> 3 > types.FIXLEN_MAX) return Error.InvalidMessage;
                         const len: usize = @intCast(word >> 3);
+                        // A float's width is decided here, at the `fixlen_word`,
+                        // never deferred to the payload (§5.2): a wrong length is
+                        // INVALID whether or not the payload arrived. The
+                        // *availability* test has to come first too, because the
+                        // float arm is the one fixlen shape that rewinds — it
+                        // carries header + word + partial payload back to the
+                        // next chunk rather than committing a resume state, so
+                        // anything announced before it would be announced again
+                        // when those bytes are re-parsed. Withholding the
+                        // announcement until the whole payload is in hand keeps
+                        // `fixlenBegin` at exactly one call per field regardless
+                        // of where the chunk boundary falls (§7.2). Nothing is
+                        // lost by waiting: a float's `total` is its subtype's
+                        // fixed width, already validated, so no schema `maxlen`
+                        // verdict depends on announcing it early — unlike
+                        // string/blob, whose length is attacker-chosen and which
+                        // commit `.payload` before returning.
+                        if (subtype == .fp32 or subtype == .fp64) {
+                            const want: usize = if (subtype == .fp64) 8 else 4;
+                            if (len != want) return Error.InvalidMessage;
+                            if (buf.len - pos < want) return field_start; // carry header+word+partial
+                        }
                         // Announce the field at its length word — before any
                         // payload byte, `total == 0` included — so a visitor
                         // enforcing a schema `maxlen` can latch INVALID here
@@ -428,12 +451,11 @@ pub const IStream = struct {
                         }
                         switch (subtype) {
                             .fp32, .fp64 => {
-                                const want: usize = if (subtype == .fp64) 8 else 4;
-                                if (len != want) return Error.InvalidMessage;
-                                if (buf.len - pos < want) return field_start; // carry header+word+partial
+                                // Width and availability were settled above, so
+                                // the payload is here in full.
                                 if (!self.skipping(V))
                                     emitFixlenValue(buf, pos, subtype == .fp64, id, visitor);
-                                pos += want;
+                                pos += len;
                             },
                             .string, .blob => {
                                 const is_blob = subtype == .blob;
@@ -954,6 +976,74 @@ test "fixlenBegin latches maxlen INVALID at the length word, no payload byte nee
     try testing.expectEqual(Status.incomplete, try decode(&over, &in_bound));
     try testing.expectEqual(@as(u32, 1), in_bound.calls);
     try testing.expectEqual(@as(usize, 10), in_bound.last_total);
+}
+
+test "fixlenBegin fires exactly once per fp32/fp64 field, at every chunk split" {
+    // §7.2 item 4: the event stream must not depend on how the input is cut up.
+    // An fp32/fp64 payload is the one fixlen shape whose header is re-parsed
+    // when the payload straddles a chunk boundary (it is carried, not committed
+    // to a resume state), so the announcement must be withheld until the whole
+    // payload is in hand — otherwise it is delivered once per feed that sees
+    // the header.
+    //
+    // id 0, wire 2 (fixlen); word (4 << 3) | 0 = fp32 len 4; payload 1.0f.
+    const fp32_msg = [_]u8{ 0x02, 0x20, 0x00, 0x00, 0x80, 0x3F };
+    // id 1, wire 2; word (8 << 3) | 1 = fp64 len 8; payload 1.0.
+    const fp64_msg = [_]u8{ 0x0A, 0x41, 0, 0, 0, 0, 0, 0, 0xF0, 0x3F };
+
+    inline for (.{ fp32_msg, fp64_msg }) |msg| {
+        var whole: FixlenAnnounce = .{};
+        try testing.expectEqual(Status.complete, try decode(&msg, &whole));
+        try testing.expectEqual(@as(u32, 1), whole.calls);
+
+        // Every possible split point, including the payload-straddling ones.
+        for (0..msg.len + 1) |cut| {
+            var split: FixlenAnnounce = .{};
+            var is = IStream.init();
+            _ = try is.feed(msg[0..cut], &split);
+            try testing.expectEqual(Status.complete, try is.feed(msg[cut..], &split));
+            try testing.expectEqual(whole.calls, split.calls);
+            try testing.expectEqual(whole.last_subtype, split.last_subtype);
+            try testing.expectEqual(whole.last_total, split.last_total);
+        }
+
+        // One byte at a time — the worst case for a carried header.
+        var one_by_one: FixlenAnnounce = .{};
+        var is1 = IStream.init();
+        for (msg) |b| _ = try is1.feed(&[_]u8{b}, &one_by_one);
+        try testing.expectEqual(Status.complete, is1.status());
+        try testing.expectEqual(whole.calls, one_by_one.calls);
+    }
+}
+
+test "fixlenBegin count is chunk-independent across a mixed fixlen message" {
+    // The same invariant over a message that mixes all four fixlen subtypes, so
+    // a float field re-announcing itself cannot hide behind a neighbouring
+    // string's committed payload state.
+    var buf: [128]u8 = undefined;
+    var os = OStream.init(&buf);
+    try os.writeFp32(1, 1.5);
+    try os.writeString(2, "chunk me");
+    try os.writeFp64(3, -2.5);
+    try os.writeBlob(4, &.{ 1, 2, 3 });
+    try os.writeFp32(5, 0.0);
+    const msg = buf[0..os.bytesUsed()];
+
+    var whole: FixlenAnnounce = .{};
+    try testing.expectEqual(Status.complete, try decode(msg, &whole));
+    try testing.expectEqual(@as(u32, 5), whole.calls);
+
+    for (1..4) |step| {
+        var chunked: FixlenAnnounce = .{};
+        var is = IStream.init();
+        var off: usize = 0;
+        while (off < msg.len) : (off += step) {
+            const end = @min(off + step, msg.len);
+            _ = try is.feed(msg[off..end], &chunked);
+        }
+        try testing.expectEqual(Status.complete, is.status());
+        try testing.expectEqual(whole.calls, chunked.calls);
+    }
 }
 
 test "an INVALID verdict latches: later feeds repeat it and status reports it" {
