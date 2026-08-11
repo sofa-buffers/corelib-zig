@@ -188,6 +188,7 @@ pub inline fn readVarintFast(base: [*]const u8) Error!Decoded {
 /// past the varint are clobbered with scratch. Callers advance the cursor by
 /// the returned length, so the next write overwrites them.
 pub inline fn writeVarintFast(dst: [*]u8, v: Unsigned) usize {
+    @setEvalBranchQuota(100_000);
     // Peel the single-byte case, for the same reason `readVarintFast` does:
     // it is the common varint and skips the length computation, the spread and
     // the 64-bit store entirely.
