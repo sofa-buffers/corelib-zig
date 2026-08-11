@@ -98,3 +98,60 @@ test "LimitExceeded is distinguishable from InvalidMessage" {
     try std.testing.expectEqualStrings("policy", classify(E.LimitExceeded));
     try std.testing.expectEqualStrings("malformed", classify(E.InvalidMessage));
 }
+
+test "sofab.arrays is the closed set of helpers generated code calls (§6.1)" {
+    // §6.1 keeps the public surface a closed, traceable name set: every helper
+    // here has an emitted call site in the Zig backend, and a helper the
+    // generator never emits cannot be traced back to a spec rule.
+    //
+    // Two used to sit here with no caller at all. `put` was `putChecked` minus
+    // the §7.1 over-count flag — the same store, silently clamping where the
+    // spec says INVALID. `trimTail` cut the trailing run of default elements
+    // off a `count: N` array, the pre-PR#29 reading of MESSAGE_SPEC §3; §3 now
+    // says the opposite (see the test below), so keeping it published offered
+    // an inverted rule as current guidance.
+    inline for (.{ "putGrowing", "putChecked", "last", "grow", "allocN", "setElem" }) |name| {
+        try std.testing.expect(@hasDecl(sofab.arrays, name));
+    }
+    inline for (.{ "put", "trimTail" }) |name| {
+        try std.testing.expect(!@hasDecl(sofab.arrays, name));
+    }
+}
+
+test "a compact array is linear and gap-free: no trailing-default elision (MESSAGE_SPEC §3)" {
+    // `M` is the array's LENGTH, so a trailing default element stays on the
+    // wire: [1, 2, 0, 0] and [1, 2] are different values and must encode
+    // differently. Trimming the trailing run would collapse them onto one
+    // another. These are the bytes of the shared vector
+    // `array_unsigned_trailing_defaults` (03 04 01 02 00 00).
+    var buf: [16]u8 = undefined;
+    var os = sofab.OStream.init(&buf);
+    try os.writeArrayUnsigned(0, &[_]u32{ 1, 2, 0, 0 });
+    const full = buf[0..os.bytesUsed()];
+    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x04, 0x01, 0x02, 0x00, 0x00 }, full);
+
+    var buf2: [16]u8 = undefined;
+    var os2 = sofab.OStream.init(&buf2);
+    try os2.writeArrayUnsigned(0, &[_]u32{ 1, 2 });
+    const trimmed = buf2[0..os2.bytesUsed()];
+    try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x01, 0x02 }, trimmed);
+    try std.testing.expect(!std.mem.eql(u8, full, trimmed));
+
+    // And the decoder reports the length it was given, with no fill-to-N.
+    const Sink = struct {
+        count: usize = 0,
+        pub fn arrayBegin(self: *@This(), id: sofab.Id, kind: sofab.ArrayKind, count: usize) void {
+            _ = id;
+            _ = kind;
+            self.count = count;
+        }
+        pub fn unsigned(self: *@This(), id: sofab.Id, v: u64) void {
+            _ = self;
+            _ = id;
+            _ = v;
+        }
+    };
+    var sink: Sink = .{};
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(full, &sink));
+    try std.testing.expectEqual(@as(usize, 4), sink.count);
+}
