@@ -69,10 +69,12 @@ pub const utf8_valid = @import("utf8.zig").utf8_valid;
 /// `string` bytes verbatim.
 pub const STRICT_UTF8 = @import("utf8.zig").STRICT_UTF8;
 
-/// Array helpers the generated encode/decode paths need for every array field
-/// (trailing-default trim/refill, bounded element stores, wrapper-array
+/// Array helpers the generated **decode** path needs for array fields (bounded
+/// element stores, growth of a decode-owned destination, wrapper-array element
 /// placement). They carry no schema knowledge — the count, the element default
-/// and the allocator are passed in.
+/// and the allocator are passed in. Encoding an array needs no helper: it is
+/// written linearly and gap-free, trailing default elements included
+/// (MESSAGE_SPEC §3).
 pub const arrays = @import("arrays.zig");
 
 test {
