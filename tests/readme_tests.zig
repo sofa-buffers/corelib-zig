@@ -22,6 +22,9 @@ const std = @import("std");
 const readme = @embedFile("readme");
 /// The compiled mirror of the section's code.
 const example = @embedFile("readme_generated_example.zig");
+/// The shipped Callgrind driver, embedded so the README cannot document a
+/// command the repo does not ship (build.zig hands it over as a module).
+const run_callgrind_sh = @embedFile("run_callgrind_sh");
 
 /// The `### Code generator` section: from its heading to the next `## ` chapter.
 const section = blk: {
@@ -32,6 +35,63 @@ const section = blk: {
     const end = std.mem.indexOf(u8, rest, "\n## ") orelse rest.len;
     break :blk rest[0..end];
 };
+
+/// The `## Benchmarks` section: from its heading to the next `## ` chapter.
+const benchmarks = blk: {
+    @setEvalBranchQuota(200_000);
+    const start = std.mem.indexOf(u8, readme, "## Benchmarks") orelse
+        @compileError("README has no `## Benchmarks` section (CORELIB_PLAN §9.8)");
+    const rest = readme[start + "## Benchmarks".len ..];
+    const end = std.mem.indexOf(u8, rest, "\n## ") orelse rest.len;
+    break :blk rest[0..end];
+};
+
+/// The command line `bench/run_callgrind.sh` documents for itself, taken from
+/// its own `# Usage:` header — the one spelling the README has to agree with.
+const callgrind_usage = blk: {
+    @setEvalBranchQuota(200_000);
+    const at = std.mem.indexOf(u8, run_callgrind_sh, "Usage:") orelse
+        @compileError("bench/run_callgrind.sh has no `Usage:` line to check the README against");
+    const rest = run_callgrind_sh[at + "Usage:".len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    break :blk std.mem.trim(u8, rest[0..end], " \t\r");
+};
+
+test "the Benchmarks section documents all three tools §10 ships" {
+    // §10: `perf` (per-op cost), `bench` (MB/s) and `run_callgrind.sh` (Ir/op).
+    // §9.8: how to run each, and what each measures. A tool that stands in the
+    // repo, works, and is never named here cannot be discovered by a reader.
+    for ([_][]const u8{
+        "zig build perf",
+        "zig build bench",
+        callgrind_usage, // `bash bench/run_callgrind.sh`
+    }) |cmd| {
+        if (std.mem.indexOf(u8, benchmarks, cmd) == null) {
+            std.debug.print(
+                "README `## Benchmarks` never shows how to run `{s}` (CORELIB_PLAN §9.8, §10)\n",
+                .{cmd},
+            );
+            return error.MissingBenchmarkTool;
+        }
+    }
+
+    // What each measures, in the terms §10 defines them in — plus the one
+    // prerequisite the Callgrind driver exits on when it is missing.
+    for ([_][]const u8{
+        "cycles/op",
+        "MB/s",
+        "Ir/op",
+        "valgrind",
+    }) |term| {
+        if (std.ascii.indexOfIgnoreCase(benchmarks, term) == null) {
+            std.debug.print(
+                "README `## Benchmarks` does not say what `{s}` covers (CORELIB_PLAN §9.8)\n",
+                .{term},
+            );
+            return error.MissingBenchmarkMeasure;
+        }
+    }
+}
 
 test "the README never spells an operation §6.1.1 closed out" {
     // `unmarshal` is covered by `marshal`; the search is case-insensitive so a

@@ -574,17 +574,27 @@ in `src/`.
 
 ## Benchmarks
 
-Two build steps mirror the other ports' `perf` and `bench` tooling — same
-workloads (a 1000-element `u64` array and a mixed message) and output format
-per [`BENCH_SPEC.md`](https://github.com/sofa-buffers/documentation/blob/main/BENCH_SPEC.md),
+Three tools mirror the other ports' `perf`, `bench` and `run_callgrind.sh`
+tooling — same workloads (a 1000-element `u64` array and a mixed message) and
+output format per [`BENCH_SPEC.md`](https://github.com/sofa-buffers/documentation/blob/main/BENCH_SPEC.md),
 so results are comparable across languages:
 
 ```bash
 zig build perf                   # cycles/op + CPU ns/op + throughput per op
 zig build bench                  # practical MB/s (encode + decode)
 zig build bench -Dcpu=native     # last few percent
+bash bench/run_callgrind.sh      # instructions/op (Callgrind Ir/op)
 ```
 
 `perf` reports the CPU-independent per-op cost (hardware cycle counter);
 `bench` reports throughput in MB/s on the current machine, both measured over a
 ~1 s process-CPU-time loop.
+
+`bench/run_callgrind.sh` reports **instructions retired per op** (`Ir/op`) under
+Callgrind — deterministic and independent of clock speed and scheduler, so the
+numbers compare across machines and against the sibling ports, and unlike
+`perf`'s cycle counter the measurement is available on every target. It needs
+`valgrind` installed and builds its tool (`zig build callgrind`) itself;
+collection is toggled on that tool's `run_<workload>` symbol, so each printed
+number is one operation's cost directly, with no rep-count subtraction. It is
+measurement tooling for reporting, not part of the test suite or CI.
