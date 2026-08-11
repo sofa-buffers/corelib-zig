@@ -62,6 +62,11 @@ pub fn build(b: *std.Build) void {
     tests_mod.addAnonymousImport("readme", .{
         .root_source_file = b.path("README.md"),
     });
+    // …and the Callgrind driver, so the command the README prints for the third
+    // §10 tool is checked against the script that actually stands here (§9.8).
+    tests_mod.addAnonymousImport("run_callgrind_sh", .{
+        .root_source_file = b.path("bench/run_callgrind.sh"),
+    });
     const conformance_tests = b.addTest(.{ .name = "conformance-tests", .root_module = tests_mod, .use_llvm = true });
 
     const test_step = b.step("test", "Run unit + conformance tests (incl. shared vectors)");
