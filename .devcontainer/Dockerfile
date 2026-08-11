@@ -9,7 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     xz-utils \
     jq \
-    # kcov build dependencies (kcov is not packaged for Ubuntu 24.04)
+    # Callgrind instruction counts: bench/run_callgrind.sh refuses to run
+    # without valgrind, so the third §10 tool needs it here to be runnable.
+    valgrind \
+    # kcov build dependencies (kcov is not packaged for Ubuntu 26.04)
     cmake \
     g++ \
     make \

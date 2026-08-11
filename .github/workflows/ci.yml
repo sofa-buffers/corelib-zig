@@ -54,6 +54,11 @@ jobs:
         run: |
           zig build perf
           zig build bench
+          # The third §10 tool is driven by bench/run_callgrind.sh under
+          # valgrind, so it is built here rather than run: this keeps its
+          # exported `run_<workload>` symbols compiling. Nothing is timed and
+          # nothing is gated on the numbers.
+          zig build callgrind
 
   # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
   # little-endian wire format round-trips correctly off little-endian hardware.

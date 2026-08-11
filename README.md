@@ -594,7 +594,8 @@ bash bench/run_callgrind.sh      # instructions/op (Callgrind Ir/op)
 Callgrind — deterministic and independent of clock speed and scheduler, so the
 numbers compare across machines and against the sibling ports, and unlike
 `perf`'s cycle counter the measurement is available on every target. It needs
-`valgrind` installed and builds its tool (`zig build callgrind`) itself;
+`valgrind` installed — the devcontainer image ships it — and builds its tool
+(`zig build callgrind`) itself;
 collection is toggled on that tool's `run_<workload>` symbol, so each printed
 number is one operation's cost directly, with no rep-count subtraction. It is
 measurement tooling for reporting, not part of the test suite or CI.
