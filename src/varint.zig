@@ -446,6 +446,55 @@ test "SWAR decode accepts non-minimal encodings and rejects over-range ones" {
     }
 }
 
+test "the boundary decoder enforces the same 64-bit bound as the SWAR path (§4.1)" {
+    // `readVarint` routes to `readVarintChecked` only when fewer than
+    // `MAX_VARINT_LEN` bytes remain, and no varint can overrun the 64-bit bound
+    // in fewer than ten bytes — so today the boundary loop never sees a
+    // *complete* over-range varint through the cursor API (the ten-byte shapes
+    // asserted above all take the SWAR path). The loop is nonetheless the
+    // reference definition of the encoding (module docs) and the bound is a
+    // property of the format, not of the path, so drive it directly: a future
+    // change to the headroom rule must not be able to turn a rejection into an
+    // acceptance on the way past.
+    const max = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 };
+    const d = (try readVarintChecked(&max, 0)).?;
+    try testing.expectEqual(std.math.maxInt(Unsigned), d.value);
+    try testing.expectEqual(@as(usize, 10), d.len);
+
+    // A tenth byte carrying more than bit 63 overflows the value range…
+    for ([_]u8{ 0x02, 0x40, 0x7F }) |bad| {
+        var buf = max;
+        buf[9] = bad;
+        try testing.expectError(Error.InvalidMessage, readVarintChecked(&buf, 0));
+    }
+    // …and one that announces an eleventh byte runs past the bound itself.
+    var eleven = max ++ [_]u8{0x00};
+    eleven[9] = 0x81;
+    try testing.expectError(Error.InvalidMessage, readVarintChecked(&eleven, 0));
+
+    // The verdict is the same read from a non-zero cursor: `start` offsets the
+    // read, it does not relax the bound.
+    var offset = [_]u8{ 0x2A, 0x00 } ++ max;
+    offset[11] = 0x02;
+    try testing.expectError(Error.InvalidMessage, readVarintChecked(&offset, 2));
+
+    // Both decoders agree on every legal shape too, over the whole length range
+    // (the fast path gets the headroom its contract requires).
+    var vals: std.ArrayList(Unsigned) = .empty;
+    defer vals.deinit(testing.allocator);
+    try swarProbeValues(&vals, testing.allocator);
+    for (vals.items) |v| {
+        var buf: [MAX_VARINT_LEN * 2]u8 = @splat(0xFF);
+        const len = refEncode(&buf, v);
+        const slow = (try readVarintChecked(buf[0..len], 0)).?;
+        const fast = try readVarintFast(&buf);
+        try testing.expectEqual(fast.value, slow.value);
+        try testing.expectEqual(fast.len, slow.len);
+        try testing.expectEqual(v, slow.value);
+        try testing.expectEqual(len, slow.len);
+    }
+}
+
 test "varint decode: u64 max round-trips" {
     // 0xFFFF_FFFF_FFFF_FFFF == 9 * 0xFF + final 0x01.
     const bytes = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 };
