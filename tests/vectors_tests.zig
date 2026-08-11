@@ -182,28 +182,16 @@ fn encodeFields(arena: std.mem.Allocator, fields: []const std.json.Value, offset
     return buf[offset..os.bytesUsed()];
 }
 
-/// Byte sink for the chunked-encode scenario: collects flushed chunks.
-const Collector = struct {
-    data: [8192]u8 = undefined,
-    len: usize = 0,
-
-    fn push(ctx: ?*anyopaque, chunk: []const u8) void {
-        const self: *Collector = @ptrCast(@alignCast(ctx.?));
-        @memcpy(self.data[self.len..][0..chunk.len], chunk);
-        self.len += chunk.len;
-    }
-};
-
 /// Encode `fields[]` through a tiny `buf_size`-byte buffer with a flush sink,
 /// so the encoder repeatedly fills, flushes, and resumes.
 fn chunkedEncode(arena: std.mem.Allocator, fields: []const std.json.Value, buf_size: usize) ![]const u8 {
     var scratch: [8]u8 = undefined;
-    var out: Collector = .{};
-    var os = sofab.OStream.initFlush(scratch[0..buf_size], 0, &out, Collector.push);
+    var out: common.Collector(8192) = .{};
+    var os = sofab.OStream.initFlush(scratch[0..buf_size], 0, &out, @TypeOf(out).push);
     try writeFields(&os, arena, fields);
     _ = os.flush();
     const copy = arena.alloc(u8, out.len) catch @panic("oom");
-    @memcpy(copy, out.data[0..out.len]);
+    @memcpy(copy, out.bytes());
     return copy;
 }
 

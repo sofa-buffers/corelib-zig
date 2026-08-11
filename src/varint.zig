@@ -131,7 +131,9 @@ pub inline fn readVarint(buf: []const u8, pos: *usize) Error!?Unsigned {
             return b;
         }
     }
-    return readVarintChecked(buf, pos);
+    const d = (try readVarintChecked(buf, pos.*)) orelse return null;
+    pos.* += d.len;
+    return d.value;
 }
 
 /// SWAR decode of one varint. `base` **must** have at least `MAX_VARINT_LEN`
@@ -208,12 +210,44 @@ pub inline fn writeVarintFast(dst: [*]u8, v: Unsigned) usize {
     return len;
 }
 
+/// SWAR encode of a whole run of varints at `dst`, ZigZag-mapping the elements
+/// first when `is_signed`. Returns the bytes written.
+///
+/// `dst` **must** have `MAX_VARINT_LEN` writable bytes per element: every
+/// element goes through `writeVarintFast`, whose scratch the next one overwrites
+/// (the last one's is overwritten by whatever the caller writes next).
+///
+/// **`noinline` for the same reason `istream.intArrayRun` is** — the mirror of
+/// this loop on the decode side. `spread7`'s mask cascade needs four 64-bit
+/// constants and x86-64 has no 64-bit immediate AND, so each one costs a
+/// `movabs` unless it can stay in a register across the loop. Inlined into the
+/// encoder, whose register pressure is set by the surrounding stream state, they
+/// get rematerialized per element; in a function of its own the loop pays for
+/// them once per run. The call is per run, not per element.
+pub noinline fn writeVarintRunFast(dst: [*]u8, data: anytype, comptime is_signed: bool) usize {
+    var off: usize = 0;
+    for (data) |e| {
+        const v: Unsigned = if (is_signed) zigzagEncode(e) else e;
+        off += writeVarintFast(dst + off, v);
+    }
+    return off;
+}
+
 /// Slow-path decode used within the last `MAX_VARINT_LEN` − 1 bytes of a
-/// buffer, where the varint may legitimately be split across chunks.
-fn readVarintChecked(buf: []const u8, pos: *usize) Error!?Unsigned {
+/// buffer, where the varint may legitimately be split across chunks. Reads from
+/// `start` and reports the value with its length, leaving the cursor to the
+/// caller.
+///
+/// It takes the cursor **by value** on purpose. It is the one varint path that
+/// is a real call, and handing it a `*usize` would make the caller's cursor
+/// escape: `parse` keeps its position in a local, and a pointer to that local
+/// crossing a call boundary forces it into memory for the whole function —
+/// every `pos` read and write in the field loop becomes a load and a store,
+/// including on the fast paths that never come here.
+fn readVarintChecked(buf: []const u8, start: usize) Error!?Decoded {
     var value: Unsigned = 0;
     var shift: u32 = 0;
-    var i = pos.*;
+    var i = start;
     while (i < buf.len) {
         const byte = buf[i];
         i += 1;
@@ -221,10 +255,7 @@ fn readVarintChecked(buf: []const u8, pos: *usize) Error!?Unsigned {
             return Error.InvalidMessage;
         }
         value |= @as(Unsigned, byte & 0x7F) << @intCast(shift);
-        if (byte & 0x80 == 0) {
-            pos.* = i;
-            return value;
-        }
+        if (byte & 0x80 == 0) return .{ .value = value, .len = i - start };
         shift += 7;
         if (shift >= 64) return Error.InvalidMessage;
     }

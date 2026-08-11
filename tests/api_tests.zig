@@ -104,16 +104,19 @@ test "sofab.arrays is the closed set of helpers generated code calls (§6.1)" {
     // here has an emitted call site in the Zig backend, and a helper the
     // generator never emits cannot be traced back to a spec rule.
     //
-    // Two used to sit here with no caller at all. `put` was `putChecked` minus
+    // Three used to sit here with no caller at all. `put` was `putChecked` minus
     // the §7.1 over-count flag — the same store, silently clamping where the
     // spec says INVALID. `trimTail` cut the trailing run of default elements
     // off a `count: N` array, the pre-PR#29 reading of MESSAGE_SPEC §3; §3 now
     // says the opposite (see the test below), so keeping it published offered
-    // an inverted rule as current guidance.
-    inline for (.{ "putGrowing", "putChecked", "last", "grow", "allocN", "setElem" }) |name| {
+    // an inverted rule as current guidance. `last` addressed the final element
+    // of a decode-allocated slice, from a wrapper-array shape the backend
+    // stopped emitting when it moved to placing an element at its wire id
+    // (`setElem`/`grow`) instead of appending.
+    inline for (.{ "putGrowing", "putChecked", "grow", "allocN", "setElem" }) |name| {
         try std.testing.expect(@hasDecl(sofab.arrays, name));
     }
-    inline for (.{ "put", "trimTail" }) |name| {
+    inline for (.{ "put", "trimTail", "last" }) |name| {
         try std.testing.expect(!@hasDecl(sofab.arrays, name));
     }
 }

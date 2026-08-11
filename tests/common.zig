@@ -218,6 +218,27 @@ pub const SkipRecorder = struct {
     }
 };
 
+/// A fixed-capacity flush sink: it concatenates the chunks an `OStream` drains
+/// into it, so a streamed encode can be compared byte for byte against the
+/// one-shot bytes. `capacity` must exceed the message under test.
+pub fn Collector(comptime capacity: usize) type {
+    return struct {
+        data: [capacity]u8 = undefined,
+        len: usize = 0,
+
+        pub fn push(ctx: ?*anyopaque, chunk: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(self.data[self.len..][0..chunk.len], chunk);
+            self.len += chunk.len;
+        }
+
+        /// Everything drained so far, in order.
+        pub fn bytes(self: *const @This()) []const u8 {
+            return self.data[0..self.len];
+        }
+    };
+}
+
 pub fn hexToBytes(arena: std.mem.Allocator, hex: []const u8) []u8 {
     const out = arena.alloc(u8, hex.len / 2) catch @panic("oom");
     return std.fmt.hexToBytes(out, hex) catch @panic("bad hex in test data");
