@@ -20,6 +20,7 @@
 const std = @import("std");
 const sofab = @import("sofab");
 const util = @import("util.zig");
+const w = @import("workloads");
 
 // ---------------------------------------------------------------------------
 // message under test (identical to perf.c / perf.cpp / perf.rs)
@@ -104,9 +105,8 @@ fn perfDecode(buf: []const u8, out: *PerfOut) void {
 // standalone 1000-element u64 array. BENCH_SPEC.md requires both benchmark
 // tools to exercise this large array *and* the typical/perf message.
 // ---------------------------------------------------------------------------
-const PERF_N = util.N;
+const PERF_N = w.N;
 
-var u64_src: [PERF_N]u64 = undefined;
 var u64_buf: [PERF_N * 11 + 16]u8 = undefined;
 var scalar_buf: [512]u8 = undefined;
 
@@ -217,7 +217,7 @@ const EncodeScalar = struct {
 const EncodeU64 = struct {
     pub fn run(_: @This()) usize {
         var os = sofab.OStream.init(&u64_buf);
-        os.writeArrayUnsigned(1, @as([]const u64, &u64_src)) catch unreachable;
+        os.writeArrayUnsigned(1, @as([]const u64, &w.src)) catch unreachable;
         return os.bytesUsed();
     }
 };
@@ -247,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Second reference workload: a standalone 1000-element u64 array, measured
     // with the exact same perf machinery as above.
-    util.makeSrc(PERF_N, &u64_src);
+    w.prepare();
 
     const enc_u64 = measureEncode(EncodeU64{});
     try perfReport(out, "encode u64[1000] (stream API)", enc_u64[0], enc_u64[1]);

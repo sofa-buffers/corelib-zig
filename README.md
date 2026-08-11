@@ -575,8 +575,8 @@ live next to the code in `src/`.
 ## Benchmarks
 
 Three tools mirror the other ports' `perf`, `bench` and `run_callgrind.sh`
-tooling — same workloads (a 1000-element `u64` array and a mixed message) and
-output format per [`BENCH_SPEC.md`](https://github.com/sofa-buffers/documentation/blob/main/BENCH_SPEC.md),
+tooling — same workloads and output format per
+[`BENCH_SPEC.md`](https://github.com/sofa-buffers/documentation/blob/main/BENCH_SPEC.md),
 so results are comparable across languages:
 
 ```bash
@@ -599,3 +599,56 @@ numbers compare across machines and against the sibling ports, and unlike
 collection is toggled on that tool's `run_<workload>` symbol, so each printed
 number is one operation's cost directly, with no rep-count subtraction. It is
 measurement tooling for reporting, not part of the test suite or CI.
+
+All three tools drive **one** list of workloads — the table in
+`bench/workloads.zig` — so the MB/s rows, the per-op report and the Ir/op rows
+measure the same code on the same data, and a workload cannot exist in one tool
+and be missing from another. `tests/bench_spec_tests.zig` holds that table
+against BENCH_SPEC's rows and runs every entry, including the two encoded sizes
+the spec states outright (`blob 1MB` = 1,000,005 bytes, `composite` = 956), so a
+workload that quietly stops encoding what the family encodes fails the test
+suite instead of printing a plausible number.
+
+### What the numbers look like
+
+x86-64 (Zig 0.16.0, ReleaseFast, shared runner — MB/s is this machine's figure,
+`Ir/op` is not):
+
+```
+Workload                           MB/s          instr/op    bytes
+encode: u64 array (1000)        3675.02            37 045     9491
+encode: typical message         1253.71               393       37
+encode: blob 1MB one-shot      37385.69           156 370  1000005
+encode: blob 1MB streaming     51192.12           176 651  1000005
+encode: composite                891.86            14 743      956
+decode: u64 array (1000)        3062.40            44 840     9491
+decode: typical message          814.78               664       37
+decode: blob 1MB              574607.31            30 255  1000005
+decode: composite               2334.60             5 381      956
+decode: composite skip-all      2326.25             5 319      956
+```
+
+Three of those rows say something other than what they look like:
+
+* **The `blob 1MB` rows are read against each other, never alone.** Five bytes
+  of that message are metadata and a million are payload, so its MB/s is the
+  host's memory bandwidth. The signal is the gap between the one-shot row (one
+  contiguous write into a caller buffer, no sink) and the streaming row (the
+  same megabyte through a 4096-byte buffer with a flush sink, ~245 flushes):
+  under `Ir/op` the divisible-run path of §5.1 costs **+13 %** here, because the
+  encoder hands each buffer-sized run to `@memcpy` rather than falling back to a
+  byte-at-a-time loop. Under MB/s the streaming row is *faster* than the
+  one-shot row — a 4 KiB buffer stays in L1 while a contiguous megabyte does
+  not, which is bandwidth talking, not the encoder. BENCH_SPEC's optional
+  `blob 1MB passthrough` row is absent because this port grants no pass-through
+  permission.
+* **`decode: blob 1MB` at 30 255 Ir for a megabyte is not a fast copy — it is no
+  copy.** Decoding hands the visitor a slice borrowed from the input buffer, so
+  the work is walking the framing of 245 chunks and nothing ever touches the
+  payload. That is the zero-copy design showing up as a measurement, and it is
+  why the row reports hundreds of GB/s instead of memory bandwidth.
+* **`decode: composite skip-all` is barely cheaper than `decode: composite`.**
+  Skipping suppresses delivery, not parsing: every header, length word and count
+  is still walked, and a visitor that declares no callback saves the handful of
+  adds the checksum visitor would have done. The saving is in what the
+  *application* then does not have to do.

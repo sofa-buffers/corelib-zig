@@ -76,6 +76,18 @@ pub fn build(b: *std.Build) void {
     tests_mod.addAnonymousImport("dockerfile", .{
         .root_source_file = b.path(".devcontainer/Dockerfile"),
     });
+    // The benchmark workload table, built against the *same* `sofab` module the
+    // tests use: BENCH_SPEC's rows, datasets and parity sizes are checked by
+    // running them (tests/bench_spec_tests.zig), not by reading the tools'
+    // output. A workload that stops encoding what the spec says then fails the
+    // suite instead of printing a plausible number.
+    const tests_workloads = b.createModule(.{
+        .root_source_file = b.path("bench/workloads.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tests_workloads.addImport("sofab", sofab);
+    tests_mod.addImport("bench_workloads", tests_workloads);
     const conformance_tests = b.addTest(.{ .name = "conformance-tests", .root_module = tests_mod, .use_llvm = true });
 
     const test_step = b.step("test", "Run unit + conformance tests (incl. shared vectors)");
@@ -90,19 +102,32 @@ pub fn build(b: *std.Build) void {
 
     // --- benchmarks (BENCH_SPEC.md) -------------------------------------------
     // Always built ReleaseFast: the numbers must reflect the shipping config.
+    //
+    // All three tools share one library module and one workload module, so the
+    // MB/s table, the per-op report and the Callgrind Ir/op table measure the
+    // very same code on the very same data — the property that makes their
+    // numbers readable against each other, and against the sibling ports.
+    const bench_sofab = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_sofab.addOptions("build_options", build_options);
+    const bench_workloads = b.createModule(.{
+        .root_source_file = b.path("bench/workloads.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_workloads.addImport("sofab", bench_sofab);
+
     inline for (.{ "bench", "perf" }) |tool| {
         const mod = b.createModule(.{
             .root_source_file = b.path("bench/" ++ tool ++ ".zig"),
             .target = target,
             .optimize = .ReleaseFast,
         });
-        const bench_sofab = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        });
-        bench_sofab.addOptions("build_options", build_options);
         mod.addImport("sofab", bench_sofab);
+        mod.addImport("workloads", bench_workloads);
         const exe = b.addExecutable(.{ .name = tool, .root_module = mod });
         b.installArtifact(exe);
         const run = b.addRunArtifact(exe);
@@ -123,13 +148,8 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .strip = false,
         });
-        const cg_sofab = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        });
-        cg_sofab.addOptions("build_options", build_options);
-        mod.addImport("sofab", cg_sofab);
+        mod.addImport("sofab", bench_sofab);
+        mod.addImport("workloads", bench_workloads);
         const exe = b.addExecutable(.{ .name = "callgrind", .root_module = mod });
         const install = b.addInstallArtifact(exe, .{});
         const step = b.step("callgrind", "Build the Callgrind instructions/op tool (run via bench/run_callgrind.sh)");

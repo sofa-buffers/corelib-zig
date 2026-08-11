@@ -1,24 +1,49 @@
 //! SofaBuffers Zig — throughput benchmark (MB/s, CPU time).
 //!
 //! Mirror of `corelib-rs/benches/bench.rs` and the C/C++ tools: encode/decode
-//! throughput for two workloads — a 1000-element u64 array and a small
-//! "typical" mixed message. Each workload runs in a ~1 s CPU-time loop and
-//! reports MB/s, and the output table matches the other ports so the
-//! implementations can be compared directly (BENCH_SPEC.md).
+//! throughput for every workload in `workloads.zig` — the 1000-element `u64`
+//! array, the small `typical` message, the unbounded 1 MB `blob` and the
+//! `composite` message. Each row runs in a ~1 s CPU-time loop and reports MB/s,
+//! and the table matches the other ports' exactly, so the implementations can
+//! be compared directly (BENCH_SPEC.md).
+//!
+//! **Read the `blob 1MB` rows against each other, not against the others.**
+//! Five bytes of that message are metadata and a million are payload, so its
+//! MB/s figure is this machine's memory bandwidth rather than a statement about
+//! the codec. The signal is the *difference* between the one-shot and streaming
+//! rows — the cost of the divisible-run path (CORELIB_PLAN §5.1) — and under
+//! MB/s that difference is a low-single-digit fraction of a bandwidth-bound
+//! row. `bench/run_callgrind.sh` is where that comparison actually reads.
 //!
 //! Run with:  `zig build bench`
 
 const std = @import("std");
-const sofab = @import("sofab");
+const w = @import("workloads");
 const util = @import("util.zig");
 
-/// Run `ctx.run()` repeatedly until ~1 s of CPU time has elapsed (after one
-/// warm-up call) and return throughput in MB/s for a message of `bytes` bytes.
+/// Adapts a comptime-known workload function to the `ctx.run()` shape the
+/// timing helpers take. The function stays comptime, so the measured loop calls
+/// it directly and can inline it — a runtime function pointer would put an
+/// indirect call into every operation and charge the short workloads several
+/// percent for the table's plumbing.
+fn Runner(comptime f: w.Op) type {
+    return struct {
+        pub inline fn run(_: @This()) usize {
+            return f();
+        }
+    };
+}
+
+/// Run `wl` repeatedly until ~1 s of CPU time has elapsed (after its setup and
+/// one warm-up call) and return throughput in MB/s for its encoded size.
 ///
 /// The clock is read once per batch, never per operation — see
 /// `util.batch_seconds`.
-fn measure(bytes: usize, ctx: anytype) f64 {
-    std.mem.doNotOptimizeAway(ctx.run()); // warmup
+fn measure(comptime wl: w.Workload) f64 {
+    const ctx = Runner(wl.run){};
+    if (wl.setup) |setup| std.mem.doNotOptimizeAway(setup());
+    std.mem.doNotOptimizeAway(ctx.run()); // warmup — also fixes `wl.bytes`
+    const bytes = wl.bytes.*;
     const batch = util.calibrateBatch(ctx);
     const t0 = util.cpuNow();
     var it: u64 = 0;
@@ -34,40 +59,8 @@ fn measure(bytes: usize, ctx: anytype) f64 {
     return @as(f64, @floatFromInt(bytes)) * @as(f64, @floatFromInt(it)) / el / 1e6;
 }
 
-const EncodeU64 = struct {
-    pub fn run(_: @This()) usize {
-        var os = sofab.OStream.init(&util.enc_u64_out);
-        os.writeArrayUnsigned(1, @as([]const u64, &util.src)) catch unreachable;
-        return os.bytesUsed();
-    }
-};
-
-const EncodeTypical = struct {
-    pub fn run(_: @This()) usize {
-        var os = sofab.OStream.init(&util.enc_typ_out);
-        util.encodeTypical(&os);
-        return os.bytesUsed();
-    }
-};
-
-fn Decode(comptime message: *const []const u8) type {
-    return struct {
-        pub fn run(_: @This()) u64 {
-            var sink: util.Checksum = .{};
-            var is = sofab.IStream.init();
-            _ = is.feed(message.*, &sink) catch unreachable;
-            return sink.acc;
-        }
-    };
-}
-
 pub fn main(init: std.process.Init) !void {
-    try util.prepare();
-
-    const enc_u64 = measure(util.u64_msg.len, EncodeU64{});
-    const enc_typ = measure(util.typ_msg.len, EncodeTypical{});
-    const dec_u64 = measure(util.u64_msg.len, Decode(&util.u64_msg){});
-    const dec_typ = measure(util.typ_msg.len, Decode(&util.typ_msg){});
+    w.prepare();
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -76,10 +69,14 @@ pub fn main(init: std.process.Init) !void {
     try out.print("=== SofaBuffers Zig throughput (CPU time, MB/s) ===\n", .{});
     try out.print("{s:<26} {s:>12}\n", .{ "Workload", "MB/s" });
     try out.print("{s:<26} {s:>12}\n", .{ "--------", "----" });
-    try out.print("{s:<26} {d:>12.2}\n", .{ "encode: u64 array (1000)", enc_u64 });
-    try out.print("{s:<26} {d:>12.2}\n", .{ "encode: typical message", enc_typ });
-    try out.print("{s:<26} {d:>12.2}\n", .{ "decode: u64 array (1000)", dec_u64 });
-    try out.print("{s:<26} {d:>12.2}\n", .{ "decode: typical message", dec_typ });
+    // The table walks the shared workload list, so a row cannot exist here and
+    // be missing from the Callgrind tool (or vice versa), and the rows come out
+    // in the order BENCH_SPEC's grammar prints them.
+    inline for (w.workloads) |wl| {
+        const mb_s = measure(wl);
+        try out.print("{s:<26} {d:>12.2}\n", .{ wl.label, mb_s });
+        try out.flush(); // a ~1 s row at a time, rather than a silent minute
+    }
     try out.print("\nMB = 1e6 bytes. ~1s CPU-time loop per workload.\n", .{});
     try out.flush();
 }
