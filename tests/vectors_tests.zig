@@ -414,6 +414,14 @@ fn parseVectors(arena: std.mem.Allocator) []const std.json.Value {
     return doc.object.get("vectors").?.array.items;
 }
 
+/// The shared `invalid_utf8` list: `string` payloads no strict encoder may put
+/// on the wire and no strict decoder may accept (CORELIB_PLAN §6.4).
+fn parseInvalidUtf8(arena: std.mem.Allocator) []const std.json.Value {
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, vectors_json, .{}) catch
+        @panic("failed to parse test_vectors.json");
+    return doc.object.get("invalid_utf8").?.array.items;
+}
+
 test "shared vectors are present and carry capability tags" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -544,4 +552,58 @@ test "every vector auto-skips its sub-sequences for a visitor that cannot descen
     }
 
     try std.testing.expect(nested >= 8);
+}
+
+test "invalid_utf8 vectors: every string writer honours the encode outcome (§6.4)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var ran: usize = 0;
+    for (parseInvalidUtf8(arena)) |vec| {
+        const name = get(vec, "name").?.string;
+        errdefer std.debug.print("invalid_utf8 vector [{s}] failed\n", .{name});
+        // `invalid_argument` is the only encode outcome this list carries; a new
+        // one would need its own handling rather than being silently ignored.
+        try std.testing.expectEqualStrings("invalid_argument", get(vec, "encode_outcome").?.string);
+
+        const id: Id = @intCast(asU64(get(vec, "id").?));
+        const payload = common.hexToBytes(arena, get(vec, "string_hex").?.string);
+        const expected = common.hexToBytes(arena, get(vec, "serialized_hex").?.string);
+        ran += 1;
+
+        var buf: [64]u8 = undefined;
+
+        // Both spellings of "write a string field" must agree: `writeString`
+        // and the generic `writeFixlen(.string)` reach the same wire shape, so
+        // the same policy has to gate both.
+        for ([_]bool{ false, true }) |via_fixlen| {
+            var os = sofab.OStream.init(&buf);
+            const res = if (via_fixlen)
+                os.writeFixlen(id, payload, .string)
+            else
+                os.writeString(id, payload);
+
+            if (comptime sofab.STRICT_UTF8) {
+                try std.testing.expectError(sofab.Error.InvalidArgument, res);
+                // Refused whole: not one byte of the field reaches the wire.
+                try std.testing.expectEqual(@as(usize, 0), os.bytesUsed());
+            } else {
+                // A documented non-strict build writes the bytes verbatim, and
+                // what it writes is exactly the vector's serialization.
+                try res;
+                try std.testing.expectEqualSlices(u8, expected, buf[0..os.bytesUsed()]);
+            }
+        }
+
+        // `blob` is opaque bytes and is never validated, in either build: the
+        // same payload under the blob subtype always goes out.
+        var os_blob = sofab.OStream.init(&buf);
+        try os_blob.writeBlob(id, payload);
+        try std.testing.expect(os_blob.bytesUsed() > payload.len);
+    }
+
+    // The list is part of the shared asset; an empty run would mean this suite
+    // silently stopped covering the encode side.
+    try std.testing.expect(ran >= 8);
 }

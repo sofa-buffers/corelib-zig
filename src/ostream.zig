@@ -468,7 +468,21 @@ pub const OStream = struct {
 
     /// Write a fixed-length field: header, `(len << 3) | subtype` varint, then
     /// the raw `data` bytes (already in wire/little-endian order for floats).
+    ///
+    /// This is the one entry point that names the subtype from a value, so it
+    /// is also where the `string` UTF-8 policy has to live (CORELIB_PLAN §6.4):
+    /// `writeString` is just the convenience spelling of `writeFixlen(id, text,
+    /// .string)`, and a check that sat only there would leave the generic call
+    /// — public API for direct corelib use, §6.1 — able to emit a `string`
+    /// field the family's decoders are required to reject.
+    ///
+    /// The subtype test costs nothing on the `blob`/`fp*` paths: every in-tree
+    /// caller passes a compile-time-known subtype, so it folds away there, and
+    /// the whole gate folds away in a `-Dstrict_utf8=false` build.
     pub fn writeFixlen(self: *OStream, id: Id, data: []const u8, subtype: FixlenType) Error!void {
+        if (comptime utf8.STRICT_UTF8) {
+            if (subtype == .string and !utf8.utf8_valid(data)) return Error.InvalidArgument;
+        }
         if (data.len > types.FIXLEN_MAX) return Error.InvalidArgument;
         try self.writeHeaderAnd(id, types.T_FIXLEN, (@as(Unsigned, data.len) << 3) | @intFromEnum(subtype));
         try self.pushRaw(data);
@@ -517,11 +531,10 @@ pub const OStream = struct {
     /// encode-side validation enforces MESSAGE_SPEC §8's producer-side MUST NOT,
     /// so a strict ecosystem's own encoders cannot emit bytes its decoders
     /// reject. When the option is compiled off the check folds away and the
-    /// bytes are written verbatim.
+    /// bytes are written verbatim. The check itself lives in `writeFixlen`, so
+    /// naming the `string` subtype through the generic call is held to exactly
+    /// the same policy.
     pub fn writeString(self: *OStream, id: Id, text: []const u8) Error!void {
-        if (comptime utf8.STRICT_UTF8) {
-            if (!utf8.utf8_valid(text)) return Error.InvalidArgument;
-        }
         try self.writeFixlen(id, text, .string);
     }
 
@@ -744,6 +757,29 @@ test "writeString: UTF-8 policy follows SOFAB_STRICT_UTF8 (§6.4)" {
         // Strict off: bytes are written verbatim, no validation.
         try os.writeString(2, &[_]u8{ 0xC0, 0x80 });
     }
+}
+
+test "writeFixlen: the .string subtype is held to the same UTF-8 policy (§6.4)" {
+    // `writeString` is only the convenience spelling; the generic `writeFixlen`
+    // is public API too (§6.1 direct-corelib use) and can name the `string`
+    // subtype itself. Whatever policy one enforces the other must enforce, or a
+    // strict build can still emit a `string` field its own decoder is required
+    // to reject.
+    const bad = [_]u8{ 0xC0, 0x80 }; // overlong NUL
+    var buf: [16]u8 = undefined;
+    var os = OStream.init(&buf);
+    // `blob` carries opaque bytes and is never validated, in either build.
+    try os.writeFixlen(1, &bad, .blob);
+    const before = os.bytesUsed();
+    if (comptime utf8.STRICT_UTF8) {
+        try testing.expectError(Error.InvalidArgument, os.writeFixlen(2, &bad, .string));
+        // Refused before any of it reaches the wire.
+        try testing.expectEqual(before, os.bytesUsed());
+    } else {
+        try os.writeFixlen(2, &bad, .string);
+    }
+    // Valid UTF-8 goes through the generic entry point unchanged.
+    try os.writeFixlen(3, "ok\xC2\xA2", .string);
 }
 
 test "sequence depth is capped at MAX_DEPTH on the encoder" {
