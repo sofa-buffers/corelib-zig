@@ -8,4 +8,6 @@ test {
     _ = @import("fixlen_array_kind_tests.zig");
     _ = @import("sequence_skip_tests.zig");
     _ = @import("api_tests.zig");
+    _ = @import("readme_generated_example.zig");
+    _ = @import("readme_tests.zig");
 }

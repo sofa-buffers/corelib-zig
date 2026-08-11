@@ -57,6 +57,11 @@ pub fn build(b: *std.Build) void {
     tests_mod.addAnonymousImport("test_vectors", .{
         .root_source_file = b.path("assets/test_vectors.json"),
     });
+    // Embed the shipped README, so the generated-object surface it documents is
+    // checked against the code that stands here (CORELIB_PLAN §6.1.1, §9).
+    tests_mod.addAnonymousImport("readme", .{
+        .root_source_file = b.path("README.md"),
+    });
     const conformance_tests = b.addTest(.{ .name = "conformance-tests", .root_module = tests_mod, .use_llvm = true });
 
     const test_step = b.step("test", "Run unit + conformance tests (incl. shared vectors)");
