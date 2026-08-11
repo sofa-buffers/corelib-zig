@@ -67,6 +67,15 @@ pub fn build(b: *std.Build) void {
     tests_mod.addAnonymousImport("run_callgrind_sh", .{
         .root_source_file = b.path("bench/run_callgrind.sh"),
     });
+    // …the coverage driver, and the devcontainer image both scripts run in, so
+    // no tool can ship "present" while the documented dev environment lacks the
+    // prerequisite it refuses to run without (§10, §11.1, §13).
+    tests_mod.addAnonymousImport("coverage_sh", .{
+        .root_source_file = b.path("coverage.sh"),
+    });
+    tests_mod.addAnonymousImport("dockerfile", .{
+        .root_source_file = b.path(".devcontainer/Dockerfile"),
+    });
     const conformance_tests = b.addTest(.{ .name = "conformance-tests", .root_module = tests_mod, .use_llvm = true });
 
     const test_step = b.step("test", "Run unit + conformance tests (incl. shared vectors)");

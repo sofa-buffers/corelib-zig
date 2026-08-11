@@ -10,4 +10,5 @@ test {
     _ = @import("api_tests.zig");
     _ = @import("readme_generated_example.zig");
     _ = @import("readme_tests.zig");
+    _ = @import("devcontainer_tests.zig");
 }
