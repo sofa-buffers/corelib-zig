@@ -16,8 +16,13 @@
 //!
 //! Both drive the same **visitor**: any pointer to a struct implementing the
 //! callbacks it cares about. Dispatch is comptime duck typing — monomorphized,
-//! no vtable — and a missing method is a no-op, so unhandled fields (and whole
-//! sub-sequences) are skipped automatically:
+//! no vtable — and a missing method is a no-op, so unhandled fields are skipped
+//! automatically. `sequenceBegin` is the one declaration that also decides
+//! **descent**: a visitor that declares it is told which scope was entered and
+//! receives that scope's children; a visitor that does not could not tell a
+//! child's id apart from an enclosing field's — every sequence opens a fresh id
+//! namespace — so the decoder consumes and discards the **whole sub-sequence**
+//! on its behalf, `sequenceEnd` included:
 //!
 //! ```zig
 //! const Sink = struct {
@@ -40,6 +45,9 @@
 //!     // `kind` names the element category — for a fixlen array its *subtype*
 //!     // (`.fp32` / `.fp64`), reported once the `fixlen_word` has been read.
 //!     pub fn arrayBegin(self: *@This(), id: sofab.Id, kind: sofab.ArrayKind, count: usize) void { ... }
+//!     // Declaring `sequenceBegin` is what opts a visitor into nested scopes:
+//!     // without it, every sub-sequence is skipped whole (children and
+//!     // `sequenceEnd` alike) — with it, the visitor owns the scope bookkeeping.
 //!     pub fn sequenceBegin(self: *@This(), id: sofab.Id) void { ... }
 //!     pub fn sequenceEnd(self: *@This()) void { ... }
 //! };
@@ -130,6 +138,36 @@ pub const IStream = struct {
     /// Create a fresh decoder ready to accept a new message.
     pub fn init() IStream {
         return .{};
+    }
+
+    /// Whether visitor type `V` can **descend** into a nested sequence: it
+    /// declares `sequenceBegin`, the callback that names the scope being
+    /// entered. That declaration is the opt-in — nothing else in a duck-typed
+    /// visitor can express it, since `sequenceBegin` is the only callback that
+    /// carries the scope's id.
+    fn canDescend(comptime V: type) bool {
+        return @hasDecl(V, "sequenceBegin");
+    }
+
+    /// True while the decoder is inside a sub-sequence the visitor cannot
+    /// descend into, i.e. while the whole sub-sequence is being **skipped**
+    /// (§5.2: "the field's remaining bytes, *or the entire sub-sequence*, are
+    /// consumed and discarded automatically").
+    ///
+    /// Each sequence opens a fresh id namespace (§3), so a child's id says
+    /// nothing about the enclosing scope: handing a child field to a visitor
+    /// that was never told the scope was entered would bind it to whatever
+    /// unrelated enclosing field shares its id — a silently wrong value. So a
+    /// visitor that declares no `sequenceBegin` gets nothing from inside a
+    /// sequence, not even the matching `sequenceEnd`.
+    ///
+    /// Skipping suppresses **delivery only**: the bytes are parsed exactly as
+    /// before, so `MAX_DEPTH`, every INVALID condition and the resync onto the
+    /// field after the scope are untouched. For a descending visitor the whole
+    /// test folds to `false` at comptime — no state, no branch, no cost.
+    inline fn skipping(self: *const IStream, comptime V: type) bool {
+        if (comptime canDescend(V)) return false;
+        return self.depth > 0;
     }
 
     /// Reset to the initial state so the decoder can be reused for a new
@@ -274,8 +312,13 @@ pub const IStream = struct {
                     // over many elements; below a handful its call setup costs
                     // more than it saves, so a short array goes straight to the
                     // tail loop.
+                    //
+                    // The depth cannot change inside an array, so whether this
+                    // array sits in a skipped scope is decided once for the
+                    // whole run (comptime `true` for a descending visitor).
+                    const emit = !self.skipping(V);
                     var rem = st.remaining;
-                    if (rem >= BULK_MIN_ELEMS) {
+                    if (emit and rem >= BULK_MIN_ELEMS) {
                         rem = if (st.signed)
                             try intArrayRun(buf, &pos, rem, st.id, true, visitor)
                         else
@@ -284,12 +327,14 @@ pub const IStream = struct {
                     while (rem > 0) {
                         const elem_start = pos;
                         if (try varint.readVarint(buf, &pos)) |val| {
-                            if (st.signed) {
-                                if (comptime @hasDecl(V, "signed"))
-                                    visitor.signed(st.id, varint.zigzagDecode(val));
-                            } else {
-                                if (comptime @hasDecl(V, "unsigned"))
-                                    visitor.unsigned(st.id, val);
+                            if (emit) {
+                                if (st.signed) {
+                                    if (comptime @hasDecl(V, "signed"))
+                                        visitor.signed(st.id, varint.zigzagDecode(val));
+                                } else {
+                                    if (comptime @hasDecl(V, "unsigned"))
+                                        visitor.unsigned(st.id, val);
+                                }
                             }
                             rem -= 1;
                         } else {
@@ -305,6 +350,7 @@ pub const IStream = struct {
                 },
                 .array_fix => |st| {
                     const elem_len: usize = if (st.fp64) 8 else 4;
+                    const emit = !self.skipping(V); // constant for the run, as above
                     var rem = st.remaining;
                     while (rem > 0) {
                         if (buf.len - pos < elem_len) {
@@ -315,7 +361,7 @@ pub const IStream = struct {
                             } };
                             return pos;
                         }
-                        emitFixlenValue(buf, pos, st.fp64, st.id, visitor);
+                        if (emit) emitFixlenValue(buf, pos, st.fp64, st.id, visitor);
                         pos += elem_len;
                         rem -= 1;
                     }
@@ -345,11 +391,15 @@ pub const IStream = struct {
                 switch (wire) {
                     types.T_VARINT_UNSIGNED => {
                         const val = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                        if (comptime @hasDecl(V, "unsigned")) visitor.unsigned(id, val);
+                        if (comptime @hasDecl(V, "unsigned")) {
+                            if (!self.skipping(V)) visitor.unsigned(id, val);
+                        }
                     },
                     types.T_VARINT_SIGNED => {
                         const zz = (try varint.readVarint(buf, &pos)) orelse return field_start;
-                        if (comptime @hasDecl(V, "signed")) visitor.signed(id, varint.zigzagDecode(zz));
+                        if (comptime @hasDecl(V, "signed")) {
+                            if (!self.skipping(V)) visitor.signed(id, varint.zigzagDecode(zz));
+                        }
                     },
 
                     types.T_FIXLEN => {
@@ -369,23 +419,31 @@ pub const IStream = struct {
                         // This mirrors `arrayBegin` for arrays one field kind
                         // over; `@hasDecl` keeps it free for a visitor that does
                         // not declare it (no vtable, no runtime branch).
-                        if (comptime @hasDecl(V, "fixlenBegin"))
-                            try visitor.fixlenBegin(id, subtype, len);
+                        // A field inside a skipped sub-sequence is not announced
+                        // either: it binds to no destination, so no schema bound
+                        // and no validation applies to it (§6.4, §7.1 — skipped
+                        // fields are never validated).
+                        if (comptime @hasDecl(V, "fixlenBegin")) {
+                            if (!self.skipping(V)) try visitor.fixlenBegin(id, subtype, len);
+                        }
                         switch (subtype) {
                             .fp32, .fp64 => {
                                 const want: usize = if (subtype == .fp64) 8 else 4;
                                 if (len != want) return Error.InvalidMessage;
                                 if (buf.len - pos < want) return field_start; // carry header+word+partial
-                                emitFixlenValue(buf, pos, subtype == .fp64, id, visitor);
+                                if (!self.skipping(V))
+                                    emitFixlenValue(buf, pos, subtype == .fp64, id, visitor);
                                 pos += want;
                             },
                             .string, .blob => {
                                 const is_blob = subtype == .blob;
                                 if (len == 0) {
-                                    if (is_blob) {
-                                        if (comptime @hasDecl(V, "blob")) visitor.blob(id, 0, 0, &.{});
-                                    } else {
-                                        if (comptime @hasDecl(V, "string")) visitor.string(id, 0, 0, &.{});
+                                    if (!self.skipping(V)) {
+                                        if (is_blob) {
+                                            if (comptime @hasDecl(V, "blob")) visitor.blob(id, 0, 0, &.{});
+                                        } else {
+                                            if (comptime @hasDecl(V, "string")) visitor.string(id, 0, 0, &.{});
+                                        }
                                     }
                                 } else {
                                     self.state = .{ .payload = .{
@@ -407,8 +465,10 @@ pub const IStream = struct {
                         const count = (try varint.readVarint(buf, &pos)) orelse return field_start;
                         if (count > types.ARRAY_MAX) return Error.InvalidMessage;
                         const is_signed = wire == types.T_VARINTARRAY_SIGNED;
-                        if (comptime @hasDecl(V, "arrayBegin"))
-                            visitor.arrayBegin(id, if (is_signed) ArrayKind.signed else ArrayKind.unsigned, @intCast(count));
+                        if (comptime @hasDecl(V, "arrayBegin")) {
+                            if (!self.skipping(V))
+                                visitor.arrayBegin(id, if (is_signed) ArrayKind.signed else ArrayKind.unsigned, @intCast(count));
+                        }
                         if (count > 0) {
                             self.state = .{ .array_int = .{
                                 .id = id,
@@ -439,8 +499,10 @@ pub const IStream = struct {
                         // names the element subtype, so the receiver can decide
                         // whether this array is the declared field's value before
                         // applying any schema bound to `count` (§4.8 step 3).
-                        if (comptime @hasDecl(V, "arrayBegin"))
-                            visitor.arrayBegin(id, if (fp64) ArrayKind.fp64 else ArrayKind.fp32, @intCast(count));
+                        if (comptime @hasDecl(V, "arrayBegin")) {
+                            if (!self.skipping(V))
+                                visitor.arrayBegin(id, if (fp64) ArrayKind.fp64 else ArrayKind.fp32, @intCast(count));
+                        }
                         if (count > 0) {
                             self.state = .{ .array_fix = .{
                                 .id = id,
@@ -456,12 +518,20 @@ pub const IStream = struct {
                         // unbounded recursion / stack growth (§4.9, §6.2).
                         if (self.depth >= types.MAX_DEPTH) return Error.InvalidMessage;
                         self.depth += 1;
+                        // A visitor with no `sequenceBegin` is not told the scope
+                        // was entered, so from here `skipping` is true until the
+                        // matching end and the whole sub-sequence is discarded.
                         if (comptime @hasDecl(V, "sequenceBegin")) visitor.sequenceBegin(id);
                     },
                     types.T_SEQUENCE_END => {
                         if (self.depth == 0) return Error.InvalidMessage;
+                        // Delivered before the pop: the end marker belongs to the
+                        // scope it closes, so a scope that was skipped does not
+                        // report its end either.
+                        if (comptime @hasDecl(V, "sequenceEnd")) {
+                            if (!self.skipping(V)) visitor.sequenceEnd();
+                        }
                         self.depth -= 1;
-                        if (comptime @hasDecl(V, "sequenceEnd")) visitor.sequenceEnd();
                     },
                 }
             }
@@ -478,10 +548,13 @@ pub const IStream = struct {
         if (avail > 0) {
             const offset = st.total - st.remaining;
             const chunk = buf[pos .. pos + avail];
-            if (st.is_blob) {
-                if (comptime @hasDecl(V, "blob")) visitor.blob(st.id, st.total, offset, chunk);
-            } else {
-                if (comptime @hasDecl(V, "string")) visitor.string(st.id, st.total, offset, chunk);
+            // A payload inside a skipped sub-sequence is walked, not delivered.
+            if (!self.skipping(V)) {
+                if (st.is_blob) {
+                    if (comptime @hasDecl(V, "blob")) visitor.blob(st.id, st.total, offset, chunk);
+                } else {
+                    if (comptime @hasDecl(V, "string")) visitor.string(st.id, st.total, offset, chunk);
+                }
             }
             pos += avail;
             const rem = st.remaining - avail;
@@ -674,6 +747,43 @@ test "visitor with no callbacks skips everything (auto-skip)" {
     const Nothing = struct {};
     var sink: Nothing = .{};
     _ = try decode(buf[0..used], &sink);
+}
+
+test "a visitor that cannot descend skips the whole sub-sequence" {
+    // §3/§5.2/§6: a sequence opens a fresh id namespace, so a child id means
+    // nothing in the enclosing scope. A visitor that declares no `sequenceBegin`
+    // is never told the scope was entered, so its children must be consumed and
+    // discarded — not delivered, where the nested `id 0` would overwrite the
+    // top-level `id 0`.
+    const FlatOnly = struct {
+        hits: [8]u64 = @splat(0),
+        ends: u32 = 0,
+        pub fn unsigned(self: *@This(), id: Id, v: Unsigned) void {
+            if (id < 8) self.hits[id] = v;
+        }
+        // Declared without `sequenceBegin`: the scope is still skipped whole, so
+        // its end is not reported either.
+        pub fn sequenceEnd(self: *@This()) void {
+            self.ends += 1;
+        }
+    };
+
+    // 00 01 | 0E | 00 63 | 07 — unsigned id 0 = 1, then a sequence carrying its
+    // own unsigned id 0 = 99.
+    var flat: FlatOnly = .{};
+    try testing.expectEqual(Status.complete, try decode(&.{ 0x00, 0x01, 0x0E, 0x00, 0x63, 0x07 }, &flat));
+    try testing.expectEqual(@as(u64, 1), flat.hits[0]);
+    try testing.expectEqual(@as(u32, 0), flat.ends);
+
+    // The full sample decoded by a visitor that *does* declare `sequenceBegin`
+    // is unaffected — every nested field still arrives (see the first test).
+    var buf: [128]u8 = undefined;
+    const used = encodeSample(&buf);
+    var flat_sample: FlatOnly = .{};
+    try testing.expectEqual(Status.complete, try decode(buf[0..used], &flat_sample));
+    // The sample's only nested field is `unsigned id 1 = 99`; the top-level
+    // `unsigned id 1 = 42` must be what survives.
+    try testing.expectEqual(@as(u64, 42), flat_sample.hits[1]);
 }
 
 test "truncated message reports Incomplete, not rejection" {

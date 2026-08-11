@@ -72,6 +72,16 @@ pub const Checksum = struct {
     pub fn blob(self: *Checksum, _: sofab.Id, _: usize, _: usize, chunk: []const u8) void {
         self.acc +%= chunk.len;
     }
+    // Declaring `sequenceBegin` is what makes a visitor descend: without it the
+    // decoder auto-skips whole sub-sequences, and the typical-message workload
+    // would stop decoding the two fields inside its nested scope — measuring
+    // less work than the other ports' benchmarks do (BENCH_SPEC).
+    pub fn sequenceBegin(self: *Checksum, id: sofab.Id) void {
+        self.acc +%= id;
+    }
+    pub fn sequenceEnd(self: *Checksum) void {
+        self.acc +%= 1;
+    }
 };
 
 /// A spread of unsigned values exercising 1..10-byte varints (identical
