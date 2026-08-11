@@ -13,6 +13,15 @@
 # --toggle-collect=run_<workload>` therefore measures a single op's Ir directly
 # — no rep-count subtraction (native symbols, unlike the JIT/interpreted ports).
 #
+# The workload names and row labels come from the tool's own `--list`, so this
+# script keeps no copy of the table: a workload added in bench/workloads.zig
+# shows up here without touching this file.
+#
+# This is where the `blob 1MB` rows earn their keep: the one-shot-to-streaming
+# delta is the cost of the divisible-run path (CORELIB_PLAN §5.1) with the
+# machine's memory bandwidth taken out of it, which under MB/s drowns in the
+# noise of a bandwidth-bound row.
+#
 # Prereqs: valgrind, zig. This builds the tool if missing.
 # Usage:   bash bench/run_callgrind.sh
 set -euo pipefail
@@ -35,7 +44,6 @@ fi
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
-WORKLOADS=(encode_u64_array encode_typical decode_u64_array decode_typical)
 
 run_cg() { # $1 workload
     valgrind --tool=callgrind --collect-atstart=no --toggle-collect="run_$1" \
@@ -46,15 +54,6 @@ run_cg() { # $1 workload
 ir_of()    { grep -m1 '^summary:' "$OUT/$1.out" 2>/dev/null | awk '{print $2}'; }
 bytes_of() { grep -ohE 'BYTES=[0-9]+' "$OUT/$1.log" 2>/dev/null | head -1 | cut -d= -f2; }
 
-label() {
-    case "$1" in
-        encode_u64_array) echo "encode: u64 array (1000)";;
-        encode_typical)   echo "encode: typical message";;
-        decode_u64_array) echo "decode: u64 array (1000)";;
-        decode_typical)   echo "decode: typical message";;
-    esac
-}
-
 echo ">> Measuring instructions/op under Callgrind (this is slow) ..." >&2
 echo
 echo "==============================================================================="
@@ -64,11 +63,15 @@ echo "==========================================================================
 printf "%-26s %16s %9s\n" "Workload" "instr/op" "bytes"
 printf "%-26s %16s %9s\n" "--------" "--------" "-----"
 
-for w in "${WORKLOADS[@]}"; do
-    run_cg "$w"
-    ir="$(ir_of "$w")"; b="$(bytes_of "$w")"
-    printf "%-26s %16s %9s\n" "$(label "$w")" "${ir:--}" "${b:--}"
-done
+while IFS=$'\t' read -r name label; do
+    [ -n "$name" ] || continue
+    run_cg "$name"
+    ir="$(ir_of "$name")"; b="$(bytes_of "$name")"
+    printf "%-26s %16s %9s\n" "$label" "${ir:--}" "${b:--}"
+done < <("$BIN" --list)
+
 echo
 echo "Ir = instructions retired (Callgrind). Independent of CPU clock and OS"
 echo "scheduling; depends only on the executed code, so it compares across machines."
+echo "The blob 1MB rows are read against each other: one-shot to streaming is the"
+echo "cost of the divisible-run path (CORELIB_PLAN §5.1) on this port."
