@@ -366,6 +366,27 @@ fn expectedEventsWithSkip(arena: std.mem.Allocator, fields: []const std.json.Val
     return ev.items;
 }
 
+/// The events a receiver that **cannot descend** must observe for `fields[]`:
+/// only the top-level, non-sequence fields. A visitor declaring no
+/// `sequenceBegin` is never told a scope was entered, so the decoder consumes
+/// and discards every sub-sequence whole (CORELIB_PLAN §5.2/§6) — nothing below
+/// depth 0 may reach it, and neither may the frame events themselves.
+fn expectedEventsTopLevelOnly(arena: std.mem.Allocator, fields: []const std.json.Value) []const Event {
+    var ev: std.ArrayList(Event) = .empty;
+    var depth: u32 = 0;
+    for (fields) |f| {
+        const op = get(f, "op").?.string;
+        if (std.mem.eql(u8, op, "sequence_begin")) {
+            depth += 1;
+        } else if (std.mem.eql(u8, op, "sequence_end")) {
+            depth -= 1;
+        } else if (depth == 0) {
+            pushFieldEvents(&ev, arena, f);
+        }
+    }
+    return ev.items;
+}
+
 // --- decode ----------------------------------------------------------------------
 
 fn decodeAll(arena: std.mem.Allocator, bytes: []const u8) ![]const Event {
@@ -489,4 +510,38 @@ test "skip_ids vectors conform (whole and chunked)" {
 
     // Every shared skip vector is supported in this build.
     try std.testing.expect(seen >= 8);
+}
+
+test "every vector auto-skips its sub-sequences for a visitor that cannot descend" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const vectors = parseVectors(arena);
+
+    // Vectors whose events a non-descending visitor must *not* see in full —
+    // the ones that actually carry a sequence. Counted so this test cannot
+    // silently degrade into "all vectors are flat anyway".
+    var nested: usize = 0;
+    for (vectors) |vec| {
+        const name = get(vec, "name").?.string;
+        errdefer std.debug.print("auto-skip vector [{s}] failed\n", .{name});
+
+        const fields = get(vec, "fields").?.array.items;
+        const bytes = common.hexToBytes(arena, get(get(vec, "serialized").?, "hex").?.string);
+        const want = expectedEventsTopLevelOnly(arena, fields);
+        if (want.len != expectedEvents(arena, fields).len) nested += 1;
+
+        var rec = common.FlatRecorder.init(arena);
+        try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(bytes, &rec));
+        try common.expectEventsEqual(want, rec.events());
+
+        // Chunk-independence: the same events one byte at a time.
+        var rec2 = common.FlatRecorder.init(arena);
+        var is = sofab.IStream.init();
+        for (bytes) |b| _ = try is.feed(&.{b}, &rec2);
+        try std.testing.expectEqual(sofab.Status.complete, is.status());
+        try common.expectEventsEqual(want, rec2.events());
+    }
+
+    try std.testing.expect(nested >= 8);
 }

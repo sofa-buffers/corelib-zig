@@ -111,6 +111,45 @@ pub const Recorder = struct {
     }
 };
 
+/// A `Recorder` that declares **no** `sequenceBegin`/`sequenceEnd` — a receiver
+/// that knows only flat fields and therefore cannot descend into a nested
+/// scope. Everything inside a sequence must be auto-skipped by the decoder
+/// (CORELIB_PLAN §5.2/§6), so this visitor may only ever record the *top-level*
+/// fields of a message.
+pub const FlatRecorder = struct {
+    rec: Recorder,
+
+    pub fn init(arena: std.mem.Allocator) FlatRecorder {
+        return .{ .rec = Recorder.init(arena) };
+    }
+
+    pub fn events(self: *const FlatRecorder) []const Event {
+        return self.rec.events.items;
+    }
+
+    pub fn unsigned(self: *FlatRecorder, id: Id, value: u64) void {
+        self.rec.unsigned(id, value);
+    }
+    pub fn signed(self: *FlatRecorder, id: Id, value: i64) void {
+        self.rec.signed(id, value);
+    }
+    pub fn fp32(self: *FlatRecorder, id: Id, value: f32) void {
+        self.rec.fp32(id, value);
+    }
+    pub fn fp64(self: *FlatRecorder, id: Id, value: f64) void {
+        self.rec.fp64(id, value);
+    }
+    pub fn string(self: *FlatRecorder, id: Id, total: usize, offset: usize, chunk: []const u8) void {
+        self.rec.string(id, total, offset, chunk);
+    }
+    pub fn blob(self: *FlatRecorder, id: Id, total: usize, offset: usize, chunk: []const u8) void {
+        self.rec.blob(id, total, offset, chunk);
+    }
+    pub fn arrayBegin(self: *FlatRecorder, id: Id, kind: sofab.ArrayKind, count: usize) void {
+        self.rec.arrayBegin(id, kind, count);
+    }
+};
+
 /// A visitor modelling a receiver that ignores a set of field `skip_ids`.
 /// Scalars/arrays with a skipped id are dropped; a skipped `sequenceBegin`
 /// drops the whole nested sequence by tracking depth until the matching end.

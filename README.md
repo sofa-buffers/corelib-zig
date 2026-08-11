@@ -200,6 +200,18 @@ _ = try sofab.decode(message, &sink); // .complete at a clean message boundary
 // sink.a == 42, sink.b == -7, sink.s[0..sink.s_len] == "hi"
 ```
 
+**Nested scopes: declaring `sequenceBegin` is what opts you in.** Every sequence
+opens a **fresh id namespace** — a child's `id 1` is unrelated to the enclosing
+scope's `id 1` — so a visitor that declares no `sequenceBegin` is never told a
+scope was entered and could not tell the two apart. For such a visitor the
+decoder therefore consumes and discards the **entire sub-sequence**, children and
+the matching `sequenceEnd` alike (CORELIB_PLAN §5.2/§6), and the visitor sees the
+message's top-level fields only. Declare `sequenceBegin` (as generated code
+always does) and you get every nested field instead, with the scope bookkeeping
+yours to do. Either way the skipped bytes are still fully parsed: `MAX_DEPTH`,
+every malformed-input verdict and the resync onto the field after the scope are
+unaffected, and the outcome does not depend on where the chunk boundaries fall.
+
 ### Deserialize stream
 
 `IStream.feed` takes chunks of any size, suspends/resumes at any byte boundary,
