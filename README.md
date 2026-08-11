@@ -276,9 +276,12 @@ decode code calls it **unconditionally** on every materialized `string`; the gat
 lives inside the primitive, so flipping the flag never regenerates code and
 generated code is identical across build configurations. On the encode side,
 `OStream.writeString` refuses a non-UTF-8 value with `error.InvalidArgument` under
-strict. `sofab.STRICT_UTF8` reflects the compiled state. When the option is off,
-`utf8_valid` folds to `true` (zero cost, no validator compiled in) and
-`writeString` writes bytes verbatim — never silent/lossy. Skipped fields are
+strict — and so does the generic `OStream.writeFixlen(id, data, .string)`, which
+is where the check lives, so every path that can put a `string`-subtype field on
+the wire is covered (`blob` and the float subtypes are never validated).
+`sofab.STRICT_UTF8` reflects the compiled state. When the option is off,
+`utf8_valid` folds to `true` (zero cost, no validator compiled in) and both
+writers emit bytes verbatim — never silent/lossy. Skipped fields are
 never validated. The validator is a real one (rejects overlong forms including
 `C0 80`, surrogates, and code points above `U+10FFFF`; accepts embedded `U+0000`).
 
