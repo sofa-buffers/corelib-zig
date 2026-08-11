@@ -19,70 +19,40 @@ const std = @import("std");
 const sofab = @import("sofab");
 const util = @import("util.zig");
 
-const N = 1000;
-
-/// Identical to bench.zig's `encodeTypical` — a small mixed message.
-fn encodeTypical(os: *sofab.OStream) void {
-    os.writeUnsigned(1, 0xDEAD_BEEF) catch unreachable;
-    os.writeSigned(2, -12345) catch unreachable;
-    os.writeBoolean(3, true) catch unreachable;
-    os.writeFp32(4, 3.14159) catch unreachable;
-    os.writeString(5, "sofab") catch unreachable;
-    os.writeArrayUnsigned(6, &[_]u16{ 10, 20, 30, 40 }) catch unreachable;
-    os.writeSequenceBeginLazy(7) catch unreachable;
-    os.writeUnsigned(1, 99) catch unreachable;
-    os.writeSigned(2, -7) catch unreachable;
-    os.writeSequenceEnd() catch unreachable;
-}
-
-var src: [N]u64 = undefined;
-var u64_buf: [N * 11 + 16]u8 = undefined;
-var typ_buf: [256]u8 = undefined;
-var enc_u64_out: [N * 11 + 16]u8 = undefined;
-var enc_typ_out: [256]u8 = undefined;
-var u64_msg: []const u8 = undefined;
-var typ_msg: []const u8 = undefined;
-
 // ---- Callgrind workload entry points (one op each) ------------------------
 // `export` gives each a stable C symbol so `--toggle-collect=run_<w>` matches.
+// The workloads themselves — data, message and buffers — are `util`'s, shared
+// with `bench.zig` so the two tools cannot drift apart.
 
 export fn run_encode_u64_array() void {
-    var os = sofab.OStream.init(&enc_u64_out);
-    os.writeArrayUnsigned(1, @as([]const u64, &src)) catch unreachable;
+    var os = sofab.OStream.init(&util.enc_u64_out);
+    os.writeArrayUnsigned(1, @as([]const u64, &util.src)) catch unreachable;
     std.mem.doNotOptimizeAway(os.bytesUsed());
 }
 
 export fn run_encode_typical() void {
-    var os = sofab.OStream.init(&enc_typ_out);
-    encodeTypical(&os);
+    var os = sofab.OStream.init(&util.enc_typ_out);
+    util.encodeTypical(&os);
     std.mem.doNotOptimizeAway(os.bytesUsed());
 }
 
 export fn run_decode_u64_array() void {
     var sink: util.Checksum = .{};
     var is = sofab.IStream.init();
-    _ = is.feed(u64_msg, &sink) catch unreachable;
+    _ = is.feed(util.u64_msg, &sink) catch unreachable;
     std.mem.doNotOptimizeAway(sink.acc);
 }
 
 export fn run_decode_typical() void {
     var sink: util.Checksum = .{};
     var is = sofab.IStream.init();
-    _ = is.feed(typ_msg, &sink) catch unreachable;
+    _ = is.feed(util.typ_msg, &sink) catch unreachable;
     std.mem.doNotOptimizeAway(sink.acc);
 }
 
 pub fn main(init: std.process.Init) !void {
-    util.makeSrc(N, &src);
-
-    // Pre-encode the messages (decode input + byte sizes) — outside the op.
-    var os_u64 = sofab.OStream.init(&u64_buf);
-    try os_u64.writeArrayUnsigned(1, @as([]const u64, &src));
-    u64_msg = u64_buf[0..os_u64.bytesUsed()];
-
-    var os_typ = sofab.OStream.init(&typ_buf);
-    encodeTypical(&os_typ);
-    typ_msg = typ_buf[0..os_typ.bytesUsed()];
+    // Decode inputs and byte sizes — outside the measured op.
+    try util.prepare();
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip(); // argv[0]
@@ -93,16 +63,16 @@ pub fn main(init: std.process.Init) !void {
     var bytes: usize = undefined;
     if (std.mem.eql(u8, workload, "encode_u64_array")) {
         @call(.never_inline, run_encode_u64_array, .{});
-        bytes = u64_msg.len;
+        bytes = util.u64_msg.len;
     } else if (std.mem.eql(u8, workload, "encode_typical")) {
         @call(.never_inline, run_encode_typical, .{});
-        bytes = typ_msg.len;
+        bytes = util.typ_msg.len;
     } else if (std.mem.eql(u8, workload, "decode_u64_array")) {
         @call(.never_inline, run_decode_u64_array, .{});
-        bytes = u64_msg.len;
+        bytes = util.u64_msg.len;
     } else if (std.mem.eql(u8, workload, "decode_typical")) {
         @call(.never_inline, run_decode_typical, .{});
-        bytes = typ_msg.len;
+        bytes = util.typ_msg.len;
     } else {
         std.process.exit(2); // unknown workload
     }

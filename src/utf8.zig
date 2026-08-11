@@ -60,6 +60,11 @@ pub fn utf8_valid(bytes: []const u8) bool {
         if (w & 0x8080808080808080 != 0) break;
         i += 8;
     }
+    // …and then the tail byte-wise, at the granularity below a word, for the
+    // same reason the word loop exists at all: a protocol string is often
+    // shorter than a single word (`"sofab"`), and handing those five bytes to
+    // the table walk costs several times what testing their top bit does.
+    while (i < bytes.len and bytes[i] < 0x80) i += 1;
     return std.unicode.utf8ValidateSlice(bytes[i..]);
 }
 

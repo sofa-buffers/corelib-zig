@@ -62,9 +62,9 @@ suite. Nothing is pulled into downstream builds.
 |------|-----|
 | Streaming **out** | `OStream` writes into a caller buffer and calls a flush callback when it fills, so a message can exceed the buffer; `bufferSet` swaps the buffer mid-stream. |
 | Streaming **in** | `IStream.feed` takes arbitrarily small chunks and suspends/resumes at any byte boundary; string/blob payloads are delivered incrementally. |
-| Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only the few bytes of a small item that straddles a chunk boundary. |
+| Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only the few bytes of the one small item that straddles a chunk boundary — once that item is complete the rest of the chunk is parsed in place, at full contiguous speed. |
 | No allocation | The codec is allocator-free — not just the hot path. Encoder state is a struct over your buffer (plus the inline sequence hold-back run, see below); the decoder's only memory is a fixed 64-byte carry buffer. Only the `sofab.arrays` helpers for dynamically sized arrays take an allocator, and only as a parameter. |
-| Raw speed | Unchecked pointer-advancing varint encode *and* decode once bounds are guaranteed, bulk `@memcpy`/native little-endian float loads, comptime-monomorphized visitor dispatch, `@branchHint(.cold)` on the drain path, ReleaseFast shipping profile. |
+| Raw speed | Unchecked pointer-advancing varint encode *and* decode once bounds are guaranteed, bulk `@memcpy`/native little-endian float loads, comptime-monomorphized visitor dispatch, **inline field writers** (a generated `serialize()` pays no call per field), `@branchHint(.cold)` on the drain path and on the chunk-boundary stitch, ReleaseFast shipping profile. |
 | Type safety | Wire types and value widths live in the type system; array element widths are comptime-checked, so an invalid element type is a compile error. |
 | Cross-language compatibility | The shared `assets/test_vectors.json` is replayed — the same bytes every other port produces — plus a big-endian (s390x) CI leg. |
 

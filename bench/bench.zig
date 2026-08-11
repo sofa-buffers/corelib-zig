@@ -12,61 +12,20 @@ const std = @import("std");
 const sofab = @import("sofab");
 const util = @import("util.zig");
 
-const N = 1000;
-
-// The float workload value (3.14159) is a fixed payload byte pattern matching
-// the other ports' bench tools — deliberately not a math constant, so the
-// encoded bytes stay identical across languages.
-
-/// A representative small telemetry-style message: a few scalars, a float, a
-/// short string and a small array — plus a nested sequence.
-fn encodeTypical(os: *sofab.OStream) void {
-    os.writeUnsigned(1, 0xDEAD_BEEF) catch unreachable;
-    os.writeSigned(2, -12345) catch unreachable;
-    os.writeBoolean(3, true) catch unreachable;
-    os.writeFp32(4, 3.14159) catch unreachable;
-    os.writeString(5, "sofab") catch unreachable;
-    os.writeArrayUnsigned(6, &[_]u16{ 10, 20, 30, 40 }) catch unreachable;
-    os.writeSequenceBeginLazy(7) catch unreachable;
-    os.writeUnsigned(1, 99) catch unreachable;
-    os.writeSigned(2, -7) catch unreachable;
-    os.writeSequenceEnd() catch unreachable;
-}
-
-/// How long one batch of operations runs before the clock is read again.
-///
-/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` is a real syscall — never
-/// vDSO-accelerated — costing on the order of a microsecond, so reading it
-/// once per operation times the clock rather than the codec. Ten milliseconds
-/// of work per read puts the clock cost under ~0.01% of a batch.
-const batch_seconds: f64 = 0.01;
-
-/// Grow a batch until it spans `batch_seconds`, so the single clock read that
-/// ends it is a rounding error against the work it timed. Doubles as warmup.
-fn calibrateBatch(ctx: anytype) u64 {
-    var batch: u64 = 1;
-    while (true) : (batch *= 2) {
-        const t0 = util.cpuNow();
-        var k: u64 = 0;
-        while (k < batch) : (k += 1) ctx.run();
-        if (util.cpuNow() - t0 >= batch_seconds) return batch;
-    }
-}
-
 /// Run `ctx.run()` repeatedly until ~1 s of CPU time has elapsed (after one
 /// warm-up call) and return throughput in MB/s for a message of `bytes` bytes.
 ///
 /// The clock is read once per batch, never per operation — see
-/// `batch_seconds`.
+/// `util.batch_seconds`.
 fn measure(bytes: usize, ctx: anytype) f64 {
-    ctx.run(); // warmup
-    const batch = calibrateBatch(ctx);
+    std.mem.doNotOptimizeAway(ctx.run()); // warmup
+    const batch = util.calibrateBatch(ctx);
     const t0 = util.cpuNow();
     var it: u64 = 0;
     var el: f64 = undefined;
     while (true) {
         var k: u64 = 0;
-        while (k < batch) : (k += 1) ctx.run();
+        while (k < batch) : (k += 1) std.mem.doNotOptimizeAway(ctx.run());
         it += batch;
         el = util.cpuNow() - t0;
         if (el >= 1.0) break;
@@ -75,58 +34,40 @@ fn measure(bytes: usize, ctx: anytype) f64 {
     return @as(f64, @floatFromInt(bytes)) * @as(f64, @floatFromInt(it)) / el / 1e6;
 }
 
-var src: [N]u64 = undefined;
-var u64_buf: [N * 11 + 16]u8 = undefined;
-var typ_buf: [256]u8 = undefined;
-var enc_u64_out: [N * 11 + 16]u8 = undefined;
-var enc_typ_out: [256]u8 = undefined;
-
 const EncodeU64 = struct {
-    fn run(_: @This()) void {
-        var os = sofab.OStream.init(&enc_u64_out);
-        os.writeArrayUnsigned(1, @as([]const u64, &src)) catch unreachable;
-        std.mem.doNotOptimizeAway(os.bytesUsed());
+    pub fn run(_: @This()) usize {
+        var os = sofab.OStream.init(&util.enc_u64_out);
+        os.writeArrayUnsigned(1, @as([]const u64, &util.src)) catch unreachable;
+        return os.bytesUsed();
     }
 };
 
 const EncodeTypical = struct {
-    fn run(_: @This()) void {
-        var os = sofab.OStream.init(&enc_typ_out);
-        encodeTypical(&os);
-        std.mem.doNotOptimizeAway(os.bytesUsed());
+    pub fn run(_: @This()) usize {
+        var os = sofab.OStream.init(&util.enc_typ_out);
+        util.encodeTypical(&os);
+        return os.bytesUsed();
     }
 };
 
 fn Decode(comptime message: *const []const u8) type {
     return struct {
-        fn run(_: @This()) void {
+        pub fn run(_: @This()) u64 {
             var sink: util.Checksum = .{};
             var is = sofab.IStream.init();
             _ = is.feed(message.*, &sink) catch unreachable;
-            std.mem.doNotOptimizeAway(sink.acc);
+            return sink.acc;
         }
     };
 }
 
-var u64_msg: []const u8 = undefined;
-var typ_msg: []const u8 = undefined;
-
 pub fn main(init: std.process.Init) !void {
-    util.makeSrc(N, &src);
+    try util.prepare();
 
-    // Pre-encode the messages (to learn their byte sizes and as decode input).
-    var os_u64 = sofab.OStream.init(&u64_buf);
-    try os_u64.writeArrayUnsigned(1, @as([]const u64, &src));
-    u64_msg = u64_buf[0..os_u64.bytesUsed()];
-
-    var os_typ = sofab.OStream.init(&typ_buf);
-    encodeTypical(&os_typ);
-    typ_msg = typ_buf[0..os_typ.bytesUsed()];
-
-    const enc_u64 = measure(u64_msg.len, EncodeU64{});
-    const enc_typ = measure(typ_msg.len, EncodeTypical{});
-    const dec_u64 = measure(u64_msg.len, Decode(&u64_msg){});
-    const dec_typ = measure(typ_msg.len, Decode(&typ_msg){});
+    const enc_u64 = measure(util.u64_msg.len, EncodeU64{});
+    const enc_typ = measure(util.typ_msg.len, EncodeTypical{});
+    const dec_u64 = measure(util.u64_msg.len, Decode(&util.u64_msg){});
+    const dec_typ = measure(util.typ_msg.len, Decode(&util.typ_msg){});
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);

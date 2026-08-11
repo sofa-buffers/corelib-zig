@@ -48,6 +48,21 @@ fn writeBigMessage(os: *sofab.OStream) !void {
     try os.writeString(17, ""); // empty string
 }
 
+/// Feed `message` in `cs`-byte chunks and assert the decoder reaches COMPLETE
+/// having delivered exactly `want` — the event stream of the same bytes decoded
+/// whole (MESSAGE_SPEC §7.2 item 4: the outcome cannot depend on where the
+/// chunk boundaries fall).
+fn expectChunkedEquals(arena: std.mem.Allocator, message: []const u8, want: []const Event, cs: usize) !void {
+    var rec = common.Recorder.init(arena);
+    var is = sofab.IStream.init();
+    var pos: usize = 0;
+    while (pos < message.len) : (pos += cs) {
+        _ = try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
+    }
+    try std.testing.expectEqual(sofab.Status.complete, is.status());
+    try common.expectEventsEqual(want, rec.events.items);
+}
+
 test "roundtrip: one-shot encode equals chunked encode, one-shot decode equals chunked decode" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -66,37 +81,25 @@ test "roundtrip: one-shot encode equals chunked encode, one-shot decode equals c
     // the constant is real — and the message carries a string far longer than
     // any of these buffers, so the divisible-run path is exercised too (§5.1).
     for ([_]usize{ sofab.MIN_OUTPUT_BUFFER, 2, 5, 16 }) |bs| {
-        const Collector = struct {
-            data: [1024]u8 = undefined,
-            len: usize = 0,
-            fn push(ctx: ?*anyopaque, chunk: []const u8) void {
-                const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                @memcpy(self.data[self.len..][0..chunk.len], chunk);
-                self.len += chunk.len;
-            }
-        };
-        var out: Collector = .{};
+        var out: common.Collector(1024) = .{};
         var scratch: [16]u8 = undefined;
-        var cos = sofab.OStream.initFlush(scratch[0..bs], 0, &out, Collector.push);
+        var cos = sofab.OStream.initFlush(scratch[0..bs], 0, &out, @TypeOf(out).push);
         try writeBigMessage(&cos);
         _ = cos.flush();
-        try std.testing.expectEqualSlices(u8, message, out.data[0..out.len]);
+        try std.testing.expectEqualSlices(u8, message, out.bytes());
     }
 
     // One-shot decode.
     var whole = common.Recorder.init(arena);
     try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(message, &whole));
 
-    // Chunked decode at several odd chunk sizes, incl. one byte at a time.
-    for ([_]usize{ 1, 3, 7, 13 }) |cs| {
-        var rec = common.Recorder.init(arena);
-        var is = sofab.IStream.init();
-        var pos: usize = 0;
-        while (pos < message.len) : (pos += cs) {
-            _ = try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
-        }
-        try std.testing.expectEqual(sofab.Status.complete, is.status());
-        try common.expectEventsEqual(whole.events.items, rec.events.items);
+    // Chunked decode at several odd chunk sizes, incl. one byte at a time, and
+    // several past the decoder's internal carry window — the sizes at which a
+    // chunk that completes a carried item still holds whole fields of its own,
+    // which the decoder has to go on parsing in place rather than through the
+    // carry buffer.
+    for ([_]usize{ 1, 3, 7, 13, 63, 64, 65, 100 }) |cs| {
+        try expectChunkedEquals(arena, message, whole.events.items, cs);
     }
 }
 
@@ -131,16 +134,6 @@ test "integer arrays survive every encode-buffer and decode-chunk boundary" {
     try u_vals.appendSlice(arena, &.{ 0, std.math.maxInt(u64) });
     try i_vals.appendSlice(arena, &.{ 0, std.math.minInt(i64), std.math.maxInt(i64) });
 
-    const Collector = struct {
-        data: [8192]u8 = undefined,
-        len: usize = 0,
-        fn push(ctx: ?*anyopaque, chunk: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            @memcpy(self.data[self.len..][0..chunk.len], chunk);
-            self.len += chunk.len;
-        }
-    };
-
     // One-shot reference bytes.
     var big: [8192]u8 = undefined;
     var os = sofab.OStream.init(&big);
@@ -151,28 +144,25 @@ test "integer arrays survive every encode-buffer and decode-chunk boundary" {
     // Encode through every buffer size across the headroom threshold.
     var bs: usize = 1;
     while (bs <= 24) : (bs += 1) {
-        var out: Collector = .{};
+        var out: common.Collector(8192) = .{};
         var scratch: [24]u8 = undefined;
-        var cos = sofab.OStream.initFlush(scratch[0..bs], 0, &out, Collector.push);
+        var cos = sofab.OStream.initFlush(scratch[0..bs], 0, &out, @TypeOf(out).push);
         try cos.writeArrayUnsigned(1, u_vals.items);
         try cos.writeArraySigned(2, i_vals.items);
         _ = cos.flush();
-        try std.testing.expectEqualSlices(u8, message, out.data[0..out.len]);
+        try std.testing.expectEqualSlices(u8, message, out.bytes());
     }
 
     // Decode at every chunk size across the same threshold.
     var whole = common.Recorder.init(arena);
     try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(message, &whole));
     var cs: usize = 1;
-    while (cs <= 24) : (cs += 1) {
-        var rec = common.Recorder.init(arena);
-        var is = sofab.IStream.init();
-        var pos: usize = 0;
-        while (pos < message.len) : (pos += cs) {
-            _ = try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
-        }
-        try std.testing.expectEqual(sofab.Status.complete, is.status());
-        try common.expectEventsEqual(whole.events.items, rec.events.items);
+    while (cs <= 24) : (cs += 1) try expectChunkedEquals(arena, message, whole.events.items, cs);
+    // …and past the decoder's carry window, where the chunk that completes a
+    // carried element still holds whole elements of its own: those must be
+    // decoded in place, and the bulk element loop picks up mid-chunk.
+    for ([_]usize{ 63, 64, 65, 127, 128, 1000 }) |wide| {
+        try expectChunkedEquals(arena, message, whole.events.items, wide);
     }
 }
 

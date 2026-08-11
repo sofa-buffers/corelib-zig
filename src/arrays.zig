@@ -56,11 +56,6 @@ pub fn putChecked(s: anytype, i: *usize, v: std.meta.Elem(@TypeOf(s)), inv: *boo
     i.* += 1;
 }
 
-/// Mutable pointer to the last element of a decode-allocated slice.
-pub fn last(s: anytype) *std.meta.Elem(@TypeOf(s)) {
-    return @constCast(&s[s.len - 1]);
-}
-
 /// Grow a decode-owned slice to `n` elements, filling new slots with `fill`.
 /// Returns false when the allocation fails — the caller then drops the data
 /// rather than writing out of range.

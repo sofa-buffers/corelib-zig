@@ -210,27 +210,13 @@ pub const IStream = struct {
         // `error.X` rather than `Error.X` throughout this function: an
         // `errdefer` with a payload capture only accepts the inferred form.)
         errdefer |e| self.latch(e);
-        var input = chunk;
-        // Finish a small item carried from the previous chunk: stitch input
-        // bytes onto it until it completes, then fall through to the direct
-        // zero-copy path for the rest of the chunk.
-        while (self.carry_len > 0 and input.len > 0) {
-            const n = @min(CARRY_CAP - self.carry_len, input.len);
-            if (n == 0) return error.InvalidMessage; // cannot happen: items are < CARRY_CAP
-            @memcpy(self.carry[self.carry_len..][0..n], input[0..n]);
-            self.carry_len += n;
-            input = input[n..];
-            const consumed = try self.parse(self.carry[0..self.carry_len], visitor);
-            if (consumed > 0) {
-                std.mem.copyForwards(
-                    u8,
-                    self.carry[0 .. self.carry_len - consumed],
-                    self.carry[consumed..self.carry_len],
-                );
-                self.carry_len -= consumed;
-            }
-        }
-        if (self.carry_len > 0) return self.status(); // chunk exhausted, item still incomplete
+        // Finish a small item carried from the previous chunk, then parse the
+        // rest of this chunk in place. A carry is the exception — most feeds
+        // start on an item boundary — so the stitch lives out of line.
+        const input = if (self.carry_len == 0)
+            chunk
+        else
+            try self.stitchCarry(chunk, visitor) orelse return self.status();
 
         // Fast path: parse straight from the caller's slice, no copy.
         const consumed = try self.parse(input, visitor);
@@ -240,6 +226,56 @@ pub const IStream = struct {
             self.carry_len = rest.len;
         }
         return self.status();
+    }
+
+    /// Stitch `chunk` onto the carried prefix of an item that straddled the
+    /// previous chunk boundary and parse it, returning the bytes of `chunk` that
+    /// are still unparsed — or `null` when the chunk ran out with the item still
+    /// incomplete.
+    ///
+    /// The stitch is over as soon as the carried *item* is: whatever the parse
+    /// leaves unconsumed is then a suffix of the bytes just copied from this
+    /// chunk, so it is handed back and parsed in place. Copying it on instead
+    /// would drag the whole rest of the chunk through `carry` a window at a
+    /// time — two copies per window, and every bulk path (`intArrayRun`'s
+    /// headroom, a payload's single-slice delivery) cut down to what fits in
+    /// `CARRY_CAP`: decoding a 1000-element `u64` array in 4 KiB chunks cost
+    /// 65 % more instructions than decoding the same message whole.
+    noinline fn stitchCarry(self: *IStream, chunk: []const u8, visitor: anytype) Error!?[]const u8 {
+        @branchHint(.cold);
+        var input = chunk;
+        while (self.carry_len > 0 and input.len > 0) {
+            const carried = self.carry_len;
+            const n = @min(CARRY_CAP - carried, input.len);
+            if (n == 0) return error.InvalidMessage; // cannot happen: items are < CARRY_CAP
+            @memcpy(self.carry[carried..][0..n], input[0..n]);
+            self.carry_len = carried + n;
+            const consumed = try self.parse(self.carry[0..self.carry_len], visitor);
+            if (consumed >= carried) {
+                // The carried item is complete — nothing shorter can be, since
+                // the previous `feed` already established that those `carried`
+                // bytes alone parse to nothing. Everything still unconsumed
+                // therefore came from `input`: rewind to it, carry empty.
+                self.carry_len = 0;
+                return input[consumed - carried ..];
+            }
+            // Still mid-item: keep the unconsumed prefix and take more bytes.
+            // `consumed > 0` is unreachable here for the same reason, but
+            // dropping the consumed bytes costs nothing and keeps the carry
+            // well-formed whatever a future parse chooses to consume.
+            if (consumed > 0) {
+                std.mem.copyForwards(
+                    u8,
+                    self.carry[0 .. self.carry_len - consumed],
+                    self.carry[consumed..self.carry_len],
+                );
+                self.carry_len -= consumed;
+            }
+            input = input[n..];
+        }
+        // Either the chunk is exhausted with the item still incomplete (carry
+        // kept for the next feed), or the chunk was empty to begin with.
+        return if (self.carry_len > 0) null else input;
     }
 
     /// Record a terminal INVALID verdict, so every later `feed` repeats it.
@@ -459,25 +495,33 @@ pub const IStream = struct {
                             },
                             .string, .blob => {
                                 const is_blob = subtype == .blob;
-                                if (len == 0) {
+                                if (len <= buf.len - pos) {
+                                    // The whole payload is in hand — every field
+                                    // of a contiguous decode, and the empty one
+                                    // (`len == 0`) either way. It goes out as a
+                                    // single borrowed slice, and no resume state
+                                    // is committed: writing `.payload` only to
+                                    // clear it again is the union store the
+                                    // common case does not need.
                                     if (!self.skipping(V)) {
+                                        const payload = buf[pos..][0..len];
                                         if (is_blob) {
-                                            if (comptime @hasDecl(V, "blob")) visitor.blob(id, 0, 0, &.{});
+                                            if (comptime @hasDecl(V, "blob")) visitor.blob(id, len, 0, payload);
                                         } else {
-                                            if (comptime @hasDecl(V, "string")) visitor.string(id, 0, 0, &.{});
+                                            if (comptime @hasDecl(V, "string")) visitor.string(id, len, 0, payload);
                                         }
                                     }
+                                    pos += len;
                                 } else {
+                                    // Straddles the end of the chunk: deliver
+                                    // what is here and resume in the next feed.
                                     self.state = .{ .payload = .{
                                         .id = id,
                                         .is_blob = is_blob,
                                         .total = len,
                                         .remaining = len,
                                     } };
-                                    pos = self.deliverPayload(buf, pos, visitor);
-                                    if (self.state == .payload) return pos;
-                                    // Fully delivered: state is back to `.none`,
-                                    // so the field loop simply carries on.
+                                    return self.deliverPayload(buf, pos, visitor);
                                 }
                             },
                         }

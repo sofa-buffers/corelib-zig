@@ -305,6 +305,12 @@ pub const OStream = struct {
         return self.writeVarintSlow(value);
     }
 
+    /// Element count from which a varint run is worth handing to the bulk
+    /// writer (`varint.writeVarintRunFast`) rather than encoding inline. Below
+    /// a handful of elements its call setup costs more than the register
+    /// pressure it relieves — the encode-side twin of `istream.BULK_MIN_ELEMS`.
+    const BULK_MIN_ELEMS = 8;
+
     /// Encode every element of `data` as a varint back to back, ZigZag-mapping
     /// them first when `is_signed`.
     ///
@@ -329,10 +335,17 @@ pub const OStream = struct {
             // loop with a single induction-variable compare instead of a
             // capacity test and an element test per element.
             const run = @min((self.buffer.len - off) / varint.MAX_VARINT_LEN, data.len - i);
-            const end = i + run;
-            while (i < end) : (i += 1) {
-                const v: Unsigned = if (is_signed) varint.zigzagEncode(data[i]) else data[i];
-                off += varint.writeVarintFast(base + off, v);
+            if (run >= BULK_MIN_ELEMS) {
+                // Long enough to amortize the out-of-line call that keeps the
+                // SWAR masks in registers for the whole run.
+                off += varint.writeVarintRunFast(base + off, data[i..][0..run], is_signed);
+                i += run;
+            } else {
+                const end = i + run;
+                while (i < end) : (i += 1) {
+                    const v: Unsigned = if (is_signed) varint.zigzagEncode(data[i]) else data[i];
+                    off += varint.writeVarintFast(base + off, v);
+                }
             }
             self.offset = off;
             // `run == 0` is the only case the fast path cannot make progress on:
@@ -447,20 +460,31 @@ pub const OStream = struct {
     }
 
     // --- scalar writers -----------------------------------------------------
+    //
+    // The value writers below are `inline`, which on this profile is not a
+    // style choice: a generated `serialize()` is a straight run of these calls,
+    // and out of line each one costs a call, a frame and an error-union return
+    // around a dozen instructions of actual work — a third of what writing the
+    // measured `typical` message costs. Inlined, the header/value pair also
+    // sees the field's `id` as the constant the call site passed, so the
+    // `ID_MAX` bound folds away with it. The bodies stay one line each:
+    // everything that would make inlining expensive — the held-back sequence
+    // run, the drain, the UTF-8 gate, the array element runs — sits behind an
+    // out-of-line call already.
 
     /// Write an unsigned-integer field.
-    pub fn writeUnsigned(self: *OStream, id: Id, value: Unsigned) Error!void {
+    pub inline fn writeUnsigned(self: *OStream, id: Id, value: Unsigned) Error!void {
         return self.writeHeaderAnd(id, types.T_VARINT_UNSIGNED, value);
     }
 
     /// Write a signed-integer field (ZigZag + varint).
-    pub fn writeSigned(self: *OStream, id: Id, value: Signed) Error!void {
+    pub inline fn writeSigned(self: *OStream, id: Id, value: Signed) Error!void {
         return self.writeHeaderAnd(id, types.T_VARINT_SIGNED, varint.zigzagEncode(value));
     }
 
     /// Write a boolean as an unsigned `0` / `1` (booleans have no wire type of
     /// their own, §4.4).
-    pub fn writeBoolean(self: *OStream, id: Id, value: bool) Error!void {
+    pub inline fn writeBoolean(self: *OStream, id: Id, value: bool) Error!void {
         try self.writeUnsigned(id, @intFromBool(value));
     }
 
@@ -515,12 +539,12 @@ pub const OStream = struct {
     }
 
     /// Write a 32-bit float field.
-    pub fn writeFp32(self: *OStream, id: Id, value: f32) Error!void {
+    pub inline fn writeFp32(self: *OStream, id: Id, value: f32) Error!void {
         return self.writeFixedFixlen(id, u32, @bitCast(value), .fp32);
     }
 
     /// Write a 64-bit float field.
-    pub fn writeFp64(self: *OStream, id: Id, value: f64) Error!void {
+    pub inline fn writeFp64(self: *OStream, id: Id, value: f64) Error!void {
         return self.writeFixedFixlen(id, u64, @bitCast(value), .fp64);
     }
 
@@ -534,12 +558,12 @@ pub const OStream = struct {
     /// bytes are written verbatim. The check itself lives in `writeFixlen`, so
     /// naming the `string` subtype through the generic call is held to exactly
     /// the same policy.
-    pub fn writeString(self: *OStream, id: Id, text: []const u8) Error!void {
+    pub inline fn writeString(self: *OStream, id: Id, text: []const u8) Error!void {
         try self.writeFixlen(id, text, .string);
     }
 
     /// Write a binary blob field.
-    pub fn writeBlob(self: *OStream, id: Id, data: []const u8) Error!void {
+    pub inline fn writeBlob(self: *OStream, id: Id, data: []const u8) Error!void {
         try self.writeFixlen(id, data, .blob);
     }
 
@@ -797,6 +821,22 @@ test "sequence depth is capped at MAX_DEPTH on the encoder" {
 
 // --- lazy sequence framing (MESSAGE_SPEC §2) ------------------------------------
 
+/// The flush sink the streaming tests below drive: it records the bytes it was
+/// handed, so a test can compare them against the one-shot encoding, and how
+/// often it was called, so a test can assert it was never called at all.
+const CountingSink = struct {
+    out: [128]u8 = undefined,
+    len: usize = 0,
+    calls: usize = 0,
+
+    fn push(ctx: ?*anyopaque, data: []const u8) void {
+        const self: *CountingSink = @ptrCast(@alignCast(ctx.?));
+        @memcpy(self.out[self.len..][0..data.len], data);
+        self.len += data.len;
+        self.calls += 1;
+    }
+};
+
 /// Encode via `body` into a scratch buffer and return the bytes written.
 fn encoded(buf: []u8, body: anytype) Error![]const u8 {
     var os = OStream.init(buf);
@@ -930,15 +970,6 @@ test "a run committed across flushes is byte-identical to the one-shot encode" {
     // a write — which passes `writeIdType` and therefore commits the run before
     // its first byte. So there is no state in which a pending run is open and a
     // flush occurs, and no test can construct one.
-    const Sink = struct {
-        out: [64]u8 = undefined,
-        len: usize = 0,
-        fn push(ctx: ?*anyopaque, data: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            @memcpy(self.out[self.len..][0..data.len], data);
-            self.len += data.len;
-        }
-    };
     // Three nested lazy opens: the committed run is three header bytes, so
     // through a 3-byte buffer it fills the buffer exactly and everything after
     // it lands in later flushes.
@@ -959,9 +990,9 @@ test "a run committed across flushes is byte-identical to the one-shot encode" {
     var one_shot_buf: [32]u8 = undefined;
     const one_shot = try encoded(&one_shot_buf, ops);
 
-    var sink: Sink = .{};
+    var sink: CountingSink = .{};
     var tiny: [3]u8 = undefined;
-    var os = OStream.initFlush(&tiny, 0, &sink, Sink.push);
+    var os = OStream.initFlush(&tiny, 0, &sink, CountingSink.push);
     try ops(&os);
     _ = os.flush();
 
@@ -1108,18 +1139,9 @@ test "a failed commit keeps the rest of the run pending" {
 }
 
 test "flush drains pending bytes and mid-stream buffer swap works" {
-    const Sink = struct {
-        out: [64]u8 = undefined,
-        len: usize = 0,
-        fn push(ctx: ?*anyopaque, data: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            @memcpy(self.out[self.len..][0..data.len], data);
-            self.len += data.len;
-        }
-    };
-    var sink: Sink = .{};
+    var sink: CountingSink = .{};
     var tiny: [2]u8 = undefined;
-    var os = OStream.initFlush(&tiny, 0, &sink, Sink.push);
+    var os = OStream.initFlush(&tiny, 0, &sink, CountingSink.push);
     try os.writeUnsigned(1, 300); // 3 bytes through a 2-byte buffer
     _ = os.flush();
     try testing.expectEqualSlices(u8, &.{ 0x08, 0xAC, 0x02 }, sink.out[0..sink.len]);
@@ -1133,21 +1155,6 @@ test "flush drains pending bytes and mid-stream buffer swap works" {
 }
 
 // --- §5.1 buffer installation ------------------------------------------------
-
-/// Sink for the installation tests: records what it was handed, so a test can
-/// assert it was never called at all.
-const CountingSink = struct {
-    out: [128]u8 = undefined,
-    len: usize = 0,
-    calls: usize = 0,
-
-    fn push(ctx: ?*anyopaque, data: []const u8) void {
-        const self: *CountingSink = @ptrCast(@alignCast(ctx.?));
-        @memcpy(self.out[self.len..][0..data.len], data);
-        self.len += data.len;
-        self.calls += 1;
-    }
-};
 
 test "a sink-backed buffer below MIN_OUTPUT_BUFFER is refused at the hand-over (§5.1)" {
     // One byte short of the minimum — for this port's declared `1`, a buffer
