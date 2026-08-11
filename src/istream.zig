@@ -815,6 +815,71 @@ test "visitor with no callbacks skips everything (auto-skip)" {
     _ = try decode(buf[0..used], &sink);
 }
 
+test "a partially-declared visitor still has every array element walked" {
+    // Auto-skip is per *callback*, not only per message: "a missing method is a
+    // no-op, so unhandled fields are skipped automatically" (module docs, §5.2).
+    // The elements of an array whose callback the visitor does not declare must
+    // still be consumed — they are varints, so the decoder cannot jump them —
+    // and the field after the array must arrive intact. The array here is both
+    // longer than `BULK_MIN_ELEMS` (so the bulk run is entered without a
+    // delivery callback to call) and fed one byte at a time (so the tail loop
+    // resumes across chunks in the same shape).
+    const UnsignedOnly = struct {
+        seen: u64 = 0,
+        hits: u32 = 0,
+        pub fn unsigned(self: *@This(), id: Id, v: Unsigned) void {
+            self.seen +%= v +% id;
+            self.hits += 1;
+        }
+    };
+
+    var buf: [256]u8 = undefined;
+    var os = OStream.init(&buf);
+    const elems = [_]i64{ -1, 2, -3, 4, -5, 6, -7, 8, -9, 10, -11, 12 };
+    os.writeArraySigned(1, &elems) catch unreachable;
+    os.writeUnsigned(2, 12345) catch unreachable; // the resync check
+    const message = buf[0..os.bytesUsed()];
+
+    var one_shot: UnsignedOnly = .{};
+    try testing.expectEqual(Status.complete, try decode(message, &one_shot));
+    try testing.expectEqual(@as(u32, 1), one_shot.hits); // the array delivered nothing
+    try testing.expectEqual(@as(u64, 12345 + 2), one_shot.seen);
+
+    var chunked: UnsignedOnly = .{};
+    var is = IStream.init();
+    for (message) |b| _ = try is.feed(&.{b}, &chunked);
+    try testing.expectEqual(Status.complete, is.status());
+    try testing.expectEqual(one_shot.hits, chunked.hits);
+    try testing.expectEqual(one_shot.seen, chunked.seen);
+
+    // The mirror image — a signed-only visitor and an unsigned array — walks the
+    // other element kind the same way.
+    const SignedOnly = struct {
+        seen: i64 = 0,
+        hits: u32 = 0,
+        pub fn signed(self: *@This(), id: Id, v: Signed) void {
+            self.seen +%= v +% @as(Signed, @intCast(id));
+            self.hits += 1;
+        }
+    };
+    var os2 = OStream.init(&buf);
+    os2.writeArrayUnsigned(1, &[_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }) catch unreachable;
+    os2.writeSigned(2, -12345) catch unreachable;
+    const message2 = buf[0..os2.bytesUsed()];
+
+    var one_shot2: SignedOnly = .{};
+    try testing.expectEqual(Status.complete, try decode(message2, &one_shot2));
+    try testing.expectEqual(@as(u32, 1), one_shot2.hits);
+    try testing.expectEqual(@as(i64, -12345 + 2), one_shot2.seen);
+
+    var chunked2: SignedOnly = .{};
+    var is2 = IStream.init();
+    for (message2) |b| _ = try is2.feed(&.{b}, &chunked2);
+    try testing.expectEqual(Status.complete, is2.status());
+    try testing.expectEqual(one_shot2.hits, chunked2.hits);
+    try testing.expectEqual(one_shot2.seen, chunked2.seen);
+}
+
 test "a visitor that cannot descend skips the whole sub-sequence" {
     // §3/§5.2/§6: a sequence opens a fresh id namespace, so a child id means
     // nothing in the enclosing scope. A visitor that declares no `sequenceBegin`
