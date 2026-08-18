@@ -76,6 +76,30 @@ pub fn allocN(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
     return s;
 }
 
+/// Mutable pointer to element `i` of a decode destination.
+///
+/// A message field is `[]const T` because the same struct is what a caller
+/// **constructs** a message from, and a comptime literal — `m.chunks = &.{&b};`
+/// — only coerces to a const slice. That constness is the encode-side contract;
+/// it says nothing about the decode side, which allocates the destination and
+/// then has to fill it. This is where the two meet, and it is the same
+/// `@constCast` that `putGrowing`, `putChecked` and `setElem` already end in,
+/// exposed for the stores that do not go through one of them.
+///
+/// Composes, which is why it is a pointer helper rather than a set of
+/// purpose-shaped ones: a decode path into a nested row reaches its leaf as
+/// `at(at(rows, i).*, j)`, and a struct element's field as `at(rows, i).x`.
+///
+/// The element id IS the array index (MESSAGE_SPEC §5.1), so a caller grows the
+/// destination to id + 1 — default-filling the gaps left by elements a
+/// conformant encoder omitted (§2) — and every child store then lands HERE, at
+/// that index. Appending instead would shorten the array by the size of any
+/// interior gap, and would decode a REOPENED element id as a second element
+/// rather than merging into the first (§7.4).
+pub fn at(s: anytype, i: usize) *std.meta.Elem(@TypeOf(s)) {
+    return @constCast(&s[i]);
+}
+
 /// Place a wrapper-array string/blob element at its wire id (= array index),
 /// growing the destination and filling the id gaps left by omitted default
 /// elements (MESSAGE_SPEC §5.1).
@@ -87,6 +111,33 @@ pub fn setElem(comptime T: type, a: std.mem.Allocator, s: *[]const T, id: usize,
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
+
+test "at writes through a const-typed destination" {
+    // What a decode does: the field is []const T for the caller's sake, the
+    // decoder allocates it and fills it in place.
+    var buf = [_]u32{ 0, 0, 0 };
+    const dst: []const u32 = buf[0..];
+    at(dst, 1).* = 7;
+    try std.testing.expectEqual(@as(u32, 7), dst[1]);
+    try std.testing.expectEqual(@as(u32, 0), dst[0]);
+}
+
+test "at composes for a nested row and a struct element" {
+    var r0 = [_]u32{ 0, 0 };
+    var r1 = [_]u32{ 0, 0 };
+    var rowbuf = [_][]const u32{ r0[0..], r1[0..] };
+    const rows: []const []const u32 = rowbuf[0..];
+    at(at(rows, 1).*, 0).* = 9; // rows[1][0]
+    try std.testing.expectEqual(@as(u32, 9), rows[1][0]);
+    try std.testing.expectEqual(@as(u32, 0), rows[0][0]);
+
+    const P = struct { x: i32 = 0, y: i32 = 0 };
+    var pts = [_]P{ .{}, .{} };
+    const ps: []const P = pts[0..];
+    at(ps, 0).x = -3; // a field of a struct element, not the element itself
+    try std.testing.expectEqual(@as(i32, -3), ps[0].x);
+    try std.testing.expectEqual(@as(i32, 0), ps[1].x);
+}
 
 test "putChecked flags an over-count element instead of clamping" {
     var dst = [_]u32{ 0, 0 };
