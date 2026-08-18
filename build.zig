@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     // policy for `string` fields. This is a *validation policy, never a
     // wire-format switch*: it only decides accept-vs-reject and never changes
     // how valid data is encoded. ON (the default) validates on the encode side
-    // and makes `utf8_valid` a real validator; OFF folds `utf8_valid` to
+    // and makes `utf8Valid` a real validator; OFF folds `utf8Valid` to
     // `return true` and drops the encode-side reject, so none of the validation
     // code is compiled in (zero `.text`/`.rodata` cost) and generated code is
     // identical across build configurations.

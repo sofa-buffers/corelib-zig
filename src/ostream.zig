@@ -505,7 +505,7 @@ pub const OStream = struct {
     /// the whole gate folds away in a `-Dstrict_utf8=false` build.
     pub fn writeFixlen(self: *OStream, id: Id, data: []const u8, subtype: FixlenType) Error!void {
         if (comptime utf8.STRICT_UTF8) {
-            if (subtype == .string and !utf8.utf8_valid(data)) return Error.InvalidArgument;
+            if (subtype == .string and !utf8.utf8Valid(data)) return Error.InvalidArgument;
         }
         if (data.len > types.FIXLEN_MAX) return Error.InvalidArgument;
         try self.writeHeaderAnd(id, types.T_FIXLEN, (@as(Unsigned, data.len) << 3) | @intFromEnum(subtype));
