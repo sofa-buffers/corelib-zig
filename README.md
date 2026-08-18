@@ -479,6 +479,59 @@ a trailing `.incomplete` into `error.IncompleteMessage`. Both blocks are
 compiled and run by the test suite (`tests/readme_generated_example.zig`), and
 `tests/readme_tests.zig` fails the build if this section drifts from them.
 
+## Support layer for generated code
+
+Not every line a generator emits is about the schema it was generated from. A
+bounded array field needs storage, a one-shot `encode()` needs somewhere to put
+the bytes it produces, an announced element count needs a growth policy, and a
+payload split across feed chunks needs stitching back together — none of which
+changes shape from one schema to the next. That code lives here rather than in
+every generated module (ARCHITECTURE §8): the capacity is a type parameter, and
+the count, the allocator and the payload length are arguments.
+
+| symbol | what it holds |
+|---|---|
+| `sofab.FixedArray(T, N)` | a `count: N` array field: `N` elements of inline capacity plus the length actually carried |
+| `sofab.CollectingSink` | the flush sink behind a one-shot `encode()`, collecting the drained bytes into the caller's allocator |
+| `sofab.PayloadAcc` | one `string`/`blob` payload arriving in pieces, stitched and handed on as its own allocation |
+| `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `allocCapped` |
+| `sofab.arrays.ARRAY_INIT_CAP` | the ceiling on what an *announced* element count may claim up front: 1024 elements |
+
+Two of them are worth spelling out here.
+
+**`FixedArray` keeps its storage to itself**, so a length can never be left
+disagreeing with the elements beside it: build a value with `init`/`set`, fill
+one from the wire with `clear`/`push`, read it with `slice()`/`len()`. A schema
+`count` is a **capacity** and the wire count is the length (MESSAGE_SPEC §3), so
+`.{}` is the empty array and `.init(&.{ 10, 20 })` is a two-element value in a
+four-element field. An element past `N` sets the caller's `inv` flag — a wire
+count above the schema count is `INVALID`, never clamped (§7.1).
+
+**`CollectingSink` does not move who allocates.** CORELIB_PLAN §5.1 assigns
+output-buffer allocation to the generated layer, and this is a sink the caller
+constructs with its own allocator and installs like any other flush target: the
+corelib supplies the mechanism, never the policy. It is the unbounded-schema
+shape — where `MAX_SIZE` is a configured ceiling rather than a size the message
+cannot reach. A schema whose bound is real needs no sink at all: allocate that
+many bytes, install them with `OStream.init`, encode in one pass.
+
+```zig
+var sink: sofab.CollectingSink = .{ .alloc = alloc };
+defer sink.deinit();
+var scratch: [512]u8 = undefined;
+var os = sofab.OStream.initFlush(&scratch, 0, &sink, sofab.CollectingSink.push);
+try os.writeUnsigned(1, 42);
+_ = os.flush();
+// error.OutOfMemory if any drain was lost: a prefix is never returned as a
+// whole message.
+const message = try sink.toOwnedSlice();
+defer alloc.free(message);
+```
+
+The generator still emits its own copy of each of these; switching it over is
+tracked by [generator#345](https://github.com/sofa-buffers/generator/issues/345).
+Nothing here is needed to use the library by hand.
+
 ## Memory handling
 
 You own every buffer. The codec is allocation-free and holds no heap memory —

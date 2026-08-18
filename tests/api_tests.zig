@@ -113,12 +113,63 @@ test "sofab.arrays is the closed set of helpers generated code calls (§6.1)" {
     // of a decode-allocated slice, from a wrapper-array shape the backend
     // stopped emitting when it moved to placing an element at its wire id
     // (`setElem`/`grow`) instead of appending.
-    inline for (.{ "putGrowing", "putChecked", "grow", "allocN", "setElem" }) |name| {
+    //
+    // `allocCapped` is the one member whose call site is still a copy: the
+    // backend emits `_allocN`, its own `@min(n, 1024)` wrapper around `allocN`,
+    // and generator#345 switches that over to this name. Traceable either way —
+    // the rule it implements is the same one, in one place instead of one per
+    // generated module.
+    inline for (.{ "putGrowing", "putChecked", "grow", "allocN", "allocCapped", "setElem" }) |name| {
         try std.testing.expect(@hasDecl(sofab.arrays, name));
     }
     inline for (.{ "put", "trimTail", "last" }) |name| {
         try std.testing.expect(!@hasDecl(sofab.arrays, name));
     }
+}
+
+test "the eager-allocation cap is a declared constant, not a magic number" {
+    // A DoS policy two conformant decoders may disagree about while producing
+    // identical bytes: no shared vector can settle it, so it is versioned with
+    // the wire code that applies it rather than baked into every generated file.
+    try std.testing.expectEqual(usize, @TypeOf(sofab.arrays.ARRAY_INIT_CAP));
+    try std.testing.expect(sofab.arrays.ARRAY_INIT_CAP > 0);
+}
+
+test "the generated layer's support types are exported (ARCHITECTURE §8)" {
+    // Schema-free types the generator used to emit a copy of into every module:
+    // the capacity is a type parameter, the allocator and the payload length are
+    // arguments.
+    const alloc = std.testing.allocator;
+
+    // A `count: 4` field holding two elements — a capacity is not a length.
+    const levels: sofab.FixedArray(u32, 4) = .init(&.{ 10, 20 });
+    try std.testing.expectEqual(@as(usize, 4), @TypeOf(levels).capacity);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20 }, levels.slice());
+    var buf: [16]u8 = undefined;
+    var os = sofab.OStream.init(&buf);
+    try os.writeArrayUnsigned(9, levels.slice());
+    const direct = buf[0..os.bytesUsed()];
+
+    // The same field through a scratch buffer far too small to hold it, drained
+    // into a sink the CALLER allocates for (CORELIB_PLAN §5.1): byte-identical
+    // to the one-shot output, as every streamed encode must be.
+    var sink: sofab.CollectingSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var scratch: [2]u8 = undefined;
+    var streamed = sofab.OStream.initFlush(&scratch, 0, &sink, sofab.CollectingSink.push);
+    try streamed.writeArrayUnsigned(9, levels.slice());
+    _ = streamed.flush();
+    const message = try sink.toOwnedSlice();
+    defer alloc.free(message);
+    try std.testing.expectEqualSlices(u8, direct, message);
+
+    // A payload split across two feed chunks, stitched into one allocation.
+    var acc: sofab.PayloadAcc = .{};
+    defer acc.deinit(alloc);
+    try std.testing.expect(try acc.push(alloc, 5, 0, "so") == null);
+    const payload = (try acc.push(alloc, 5, 2, "fab")).?;
+    defer alloc.free(@constCast(payload));
+    try std.testing.expectEqualStrings("sofab", payload);
 }
 
 test "a compact array is linear and gap-free: no trailing-default elision (MESSAGE_SPEC §3)" {

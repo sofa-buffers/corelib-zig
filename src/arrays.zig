@@ -100,6 +100,32 @@ pub fn at(s: anytype, i: usize) *std.meta.Elem(@TypeOf(s)) {
     return @constCast(&s[i]);
 }
 
+/// Ceiling on the storage an *announced* element count may claim up front
+/// (`allocCapped`), in elements.
+///
+/// A DoS policy constant, not a wire one: two decoders may disagree about it
+/// and still accept the same messages and recover the same values, so no shared
+/// vector can settle it. It is versioned with the wire code instead, here, next
+/// to the growth policy it belongs to.
+///
+/// In elements rather than bytes, so the worst case scales with the element
+/// width: 1024 `u64`s is 8 KiB of eager storage, and every element a larger
+/// count claims beyond that is paid for only as it actually arrives.
+pub const ARRAY_INIT_CAP: usize = 1024;
+
+/// Initial storage for a native array announcing `n` wire elements, capped at
+/// `ARRAY_INIT_CAP`.
+///
+/// The announced count is untrusted until its elements arrive: CORELIB_PLAN
+/// §4.8 has a decoder read `element_count` "allocating nothing on the strength
+/// of that count", so a one-line header claiming `2^31` elements must cost a
+/// bounded allocation and nothing more. `putGrowing` then extends the store as
+/// the elements really arrive, never past `n`. On allocation failure the array
+/// decodes as empty.
+pub fn allocCapped(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
+    return allocN(T, a, @min(n, ARRAY_INIT_CAP));
+}
+
 /// Place a wrapper-array string/blob element at its wire id (= array index),
 /// growing the destination and filling the id gaps left by omitted default
 /// elements (MESSAGE_SPEC §5.1).
@@ -206,4 +232,39 @@ test "allocN yields exactly n zeroed elements" {
     defer std.testing.allocator.free(@constCast(s));
     try std.testing.expectEqual(@as(usize, 3), s.len);
     for (s) |v| try std.testing.expectEqual(@as(u32, 0), v);
+}
+
+test "allocCapped hands a count under the cap through untouched" {
+    const s = allocCapped(u32, std.testing.allocator, 3);
+    defer std.testing.allocator.free(@constCast(s));
+    try std.testing.expectEqual(@as(usize, 3), s.len);
+    for (s) |v| try std.testing.expectEqual(@as(u32, 0), v);
+}
+
+test "allocCapped allocates nothing on the strength of an absurd count" {
+    // A header announcing 2^31 - 1 elements — 8 GiB of u32 — against a pool
+    // that holds only the cap. An eager allocation of the announced count
+    // cannot come out of this buffer at all, so the array would decode as
+    // empty; the capped one fits and the elements then arrive into it.
+    var pool: [ARRAY_INIT_CAP * @sizeOf(u32) + 64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&pool);
+    const s = allocCapped(u32, fba.allocator(), 2_147_483_647);
+    try std.testing.expectEqual(ARRAY_INIT_CAP, s.len);
+    for (s) |v| try std.testing.expectEqual(@as(u32, 0), v);
+}
+
+test "the capped store still holds the elements that do arrive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The announced count is a lie, so the eager allocation is the cap; the two
+    // elements that follow land in it without growing anything.
+    const n: usize = 2_147_483_647;
+    var s = allocCapped(u32, a, n);
+    var i: usize = 0;
+    putGrowing(&s, a, &i, n, 7);
+    putGrowing(&s, a, &i, n, 8);
+    try std.testing.expectEqual(@as(usize, 2), i);
+    try std.testing.expectEqual(ARRAY_INIT_CAP, s.len);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 8 }, s[0..2]);
 }
