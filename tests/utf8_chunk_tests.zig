@@ -4,8 +4,8 @@
 //! UTF-8 validity is a property of a `string` field's **complete payload**, and
 //! a chunk boundary MUST NOT affect the outcome. Zig is a byte-container
 //! target: the corelib delivers the payload and *generated* code calls
-//! `sofab.utf8_valid` on the materialized string (README, §6.4 "the
-//! `utf8_valid` primitive"). So the obligation this suite pins on the corelib
+//! `sofab.utf8Valid` on the materialized string (README, §6.4 "the
+//! `utf8Valid` primitive"). So the obligation this suite pins on the corelib
 //! is the half it owns — **delivery**:
 //!
 //!   * every payload byte is delivered exactly once, in order, at its
@@ -42,7 +42,7 @@ const vectors_json = @embedFile("test_vectors");
 const PREFIX_LEN = 100;
 
 /// A visitor modelling what generated decode code does with a `string` field:
-/// assemble the delivered chunks and run `sofab.utf8_valid` **once, at payload
+/// assemble the delivered chunks and run `sofab.utf8Valid` **once, at payload
 /// completion** — never per chunk, never mid-payload (§6.4).
 ///
 /// It also records what the corelib promised about delivery, so a wrong
@@ -58,7 +58,7 @@ const StringSink = struct {
     chunks: usize = 0,
     /// Number of times a payload reached its declared length.
     completions: usize = 0,
-    /// `utf8_valid` of the whole payload, recorded at completion. `null` while
+    /// `utf8Valid` of the whole payload, recorded at completion. `null` while
     /// no payload has completed — the state in which §6.4 forbids a verdict.
     verdict: ?bool = null,
     /// Cleared if a chunk arrived at an offset other than the running total,
@@ -78,7 +78,7 @@ const StringSink = struct {
         self.len = offset + chunk.len;
         if (self.len == total) {
             self.completions += 1;
-            self.verdict = sofab.utf8_valid(self.data[0..total]);
+            self.verdict = sofab.utf8Valid(self.data[0..total]);
         }
     }
 
