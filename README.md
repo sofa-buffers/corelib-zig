@@ -284,9 +284,6 @@ the wire is covered (`blob` and the float subtypes are never validated).
 writers emit bytes verbatim — never silent/lossy. Skipped fields are
 never validated. The validator is a real one (rejects overlong forms including
 `C0 80`, surrogates, and code points above `U+10FFFF`; accepts embedded `U+0000`).
-`sofab.utf8_valid` is a deprecated alias of the same function, kept only because
-generated code still emits the old snake_case spelling; it goes away once the
-generator emits `utf8Valid`.
 
 ### Code generator
 

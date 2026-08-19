@@ -68,17 +68,6 @@ pub fn utf8Valid(bytes: []const u8) bool {
     return std.unicode.utf8ValidateSlice(bytes[i..]);
 }
 
-/// Deprecated spelling of `utf8Valid`, kept so the two repositories can switch
-/// over in either order.
-///
-/// The generator (sofa-buffers/generator) still emits `sofab.utf8_valid(...)`
-/// in every Zig visitor that materializes a `string`, and its `lang-zig` CI
-/// builds that generated code against **this** repository's `main`. Dropping
-/// the old name in the same commit that introduces the new one would therefore
-/// turn the generator's CI red for as long as its own rename is unmerged. The
-/// alias is removed in a follow-up, once the generator emits `utf8Valid`.
-pub const utf8_valid = utf8Valid;
-
 // --- unit tests -----------------------------------------------------------------
 
 const testing = std.testing;
@@ -149,11 +138,4 @@ test "strict-off build folds utf8Valid to accept-verbatim" {
         try testing.expect(utf8Valid(&[_]u8{ 0xC0, 0x80 }));
         try testing.expect(utf8Valid(&[_]u8{0xFF}));
     }
-}
-
-test "the deprecated utf8_valid alias resolves to utf8Valid" {
-    // Generated code from the current generator still calls the old name; this
-    // pins the alias until that emission is switched over.
-    try testing.expect(utf8_valid == utf8Valid);
-    try testing.expect(utf8_valid("hello, world"));
 }
