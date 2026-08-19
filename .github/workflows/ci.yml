@@ -6,20 +6,49 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One in-flight run per ref. A superseded pull-request run is cancelled rather
+# than left to hold runners the newer push needs; main is never cancelled, so
+# every commit on it keeps a complete result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   ZIG_VERSION: 0.16.0
+
+# Every job below carries a `timeout-minutes`. A hung step has to fail fast and
+# say which job it was: the account's Actions concurrency is 20, so a wedged job
+# is a slot every other repository in the family queues behind — and GitHub's
+# default cap of 360 minutes holds that slot for six hours.
 
 jobs:
   # Formatting, denying any unformatted file.
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # ~15 s observed
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig fmt --check build.zig src tests bench
+
+  # Compile-only gate between the lint and the test fan-out. `zig build` takes
+  # ~20 s while `zig build test` needs ~28 s more on top, and behind the fan-out
+  # sits the 32-bit pair and a QEMU s390x leg — so a plain compile error is
+  # cheapest to learn about here, once, instead of six times in parallel.
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10   # ~30 s observed
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build
 
   # Build + full test suite (incl. the shared vectors from assets/) in both
   # optimize modes: Debug keeps all safety checks; ReleaseFast is the shipping
@@ -36,6 +65,8 @@ jobs:
   test:
     name: Test (x86_64, ${{ matrix.mode }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # ~1.5 min observed per leg
+    needs: [build]
     strategy:
       fail-fast: false
       matrix:
@@ -55,14 +86,24 @@ jobs:
   test-big-endian:
     name: Test (s390x big-endian)
     runs-on: ubuntu-latest
+    timeout-minutes: 20   # ~4.5 min observed (QEMU emulation)
+    needs: [build]
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      # Retried: a stalled apt mirror is the one step in this job that has
+      # actually wedged, and it fails by hanging rather than by erroring.
       - name: Install QEMU user emulation
         run: |
-          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          ok=
+          for i in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y qemu-user-static; then ok=1; break; fi
+            echo "::warning::attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          [ -n "$ok" ] || { echo "::error::giving up after 3 attempts"; exit 1; }
           # Zig invokes the interpreter as `qemu-s390x`; Ubuntu ships it as
           # `qemu-s390x-static`.
           sudo ln -sf /usr/bin/qemu-s390x-static /usr/local/bin/qemu-s390x
@@ -79,6 +120,8 @@ jobs:
   test-32bit:
     name: Test (x86 32-bit, ${{ matrix.mode }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # ~40 s observed per leg
+    needs: [build]
     strategy:
       fail-fast: false
       matrix:
@@ -95,6 +138,8 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 20   # ~2 min observed, dominated by the kcov source build
+    needs: [build]
     permissions:
       contents: write   # push the badge JSON to the `badges` branch
     steps:
@@ -106,10 +151,25 @@ jobs:
       # kcov is not packaged for Ubuntu 24.04 — build the pinned release.
       - name: Build kcov
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake g++ binutils-dev libdw-dev libiberty-dev \
-            libcurl4-openssl-dev zlib1g-dev libssl-dev jq
-          curl -fsSL https://github.com/SimonKagstrom/kcov/archive/refs/tags/v43.tar.gz | tar xz -C /tmp
+          # Both network fetches are retried: apt and the GitHub tarball are the
+          # two steps here that can hang or fail transiently. The compile below
+          # is local work and needs no retry.
+          ok=
+          for i in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y \
+                 cmake g++ binutils-dev libdw-dev libiberty-dev \
+                 libcurl4-openssl-dev zlib1g-dev libssl-dev jq; then ok=1; break; fi
+            echo "::warning::apt attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          [ -n "$ok" ] || { echo "::error::giving up after 3 apt attempts"; exit 1; }
+          ok=
+          for i in 1 2 3; do
+            if curl -fsSL https://github.com/SimonKagstrom/kcov/archive/refs/tags/v43.tar.gz | tar xz -C /tmp; then ok=1; break; fi
+            echo "::warning::kcov download attempt $i failed, retrying in 15s"
+            sleep 15
+          done
+          [ -n "$ok" ] || { echo "::error::giving up after 3 download attempts"; exit 1; }
           cmake -S /tmp/kcov-43 -B /tmp/kcov-43/build -DCMAKE_BUILD_TYPE=Release
           make -C /tmp/kcov-43/build -j"$(nproc)"
           sudo make -C /tmp/kcov-43/build install

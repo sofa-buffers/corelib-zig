@@ -1,0 +1,54 @@
+name: "Version consistency"
+
+# The git tag is the source of truth for the version: the package manifest must
+# match it. Zig has exactly one manifest, `build.zig.zon`, so this workflow has
+# exactly one comparison to make.
+#
+# Tags only: the comparison is only meaningful when there is a tag to compare
+# against. Between releases `build.zig.zon` may legitimately sit ahead of the
+# newest tag, so running this on every push and pull request produced noise,
+# not signal — and cost a runner slot per run.
+on:
+  push:
+    tags: [ 'v*' ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check-versions:
+    name: Check versions
+    runs-on: ubuntu-latest
+    # Bounded like every other job in this repo: a checkout plus two greps has
+    # no business holding one of the account's 20 concurrent slots for hours.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # need tags for the reference version
+
+      - name: Reference version (git tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            ref_version=${GITHUB_REF_NAME#v}
+          else
+            # Latest tag on a manual/branch run; empty if the repo has no tags
+            # yet, in which case the comparison is skipped.
+            ref_version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+            [[ -n "$ref_version" ]] || echo "::notice::no git tag found; skipping version comparison"
+          fi
+          echo "REF_VERSION=$ref_version" >> "$GITHUB_ENV"
+
+      - name: Check Zig package manifest (build.zig.zon)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `.version = "x.y.z",` on its own line in the ZON manifest.
+          version=$(grep -oP '^\s*\.version\s*=\s*"\K[^"]+' build.zig.zon | head -1)
+          [[ -n "$version" ]] || { echo "::error::build.zig.zon: no .version field found"; exit 1; }
+          [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || { echo "::error::build.zig.zon version: '$version' != '$REF_VERSION'"; exit 1; }
+          echo "build.zig.zon version: $version"
