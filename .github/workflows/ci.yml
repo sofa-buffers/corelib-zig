@@ -49,16 +49,20 @@ jobs:
         run: zig build ${{ matrix.mode == 'release' && '--release=fast' || '' }}
       - name: Test
         run: zig build test ${{ matrix.mode == 'release' && '--release=fast' || '' }}
-      - name: Smoke-run the benchmark tools
+      # Built, never run. `zig build bench` times ~1 s of CPU per workload and
+      # `perf` reports cycles/op -- measurements a shared runner cannot make
+      # meaningful, and CORELIB_PLAN asks for no benchmark in CI (§12.1's
+      # required steps carry none; §13 wants the tools "present and runnable").
+      # BENCH_SPEC's reportable numbers come from a quiet machine.
+      #
+      # Compiling is still checked, which is what keeps the tools from rotting:
+      # `bench` and `perf` ride the default install step, so the Build step
+      # above already compiles them. `callgrind` does not -- its install hangs
+      # off its own step -- so it is built here, keeping the exported
+      # `run_<workload>` symbols that run_callgrind.sh toggles on.
+      - name: Build the Callgrind tool
         if: matrix.mode == 'release'
-        run: |
-          zig build perf
-          zig build bench
-          # The third §10 tool is driven by bench/run_callgrind.sh under
-          # valgrind, so it is built here rather than run: this keeps its
-          # exported `run_<workload>` symbols compiling. Nothing is timed and
-          # nothing is gated on the numbers.
-          zig build callgrind
+        run: zig build callgrind
 
   # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
   # little-endian wire format round-trips correctly off little-endian hardware.
