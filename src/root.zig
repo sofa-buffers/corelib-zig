@@ -64,10 +64,6 @@ pub const decode = @import("istream.zig").decode;
 /// generator emits an unconditional call to this on every materialized string;
 /// the strict/non-strict gate lives inside the primitive (`STRICT_UTF8`).
 pub const utf8Valid = @import("utf8.zig").utf8Valid;
-/// Deprecated spelling of `utf8Valid`. Generated code still emits the old name
-/// and the generator's CI builds it against this repository's `main`, so the
-/// alias stays until that emission is switched over; a follow-up removes it.
-pub const utf8_valid = @import("utf8.zig").utf8_valid;
 /// Compile-time state of `SOFAB_STRICT_UTF8` (Zig build option `strict_utf8`,
 /// default on). When off, `utf8Valid` folds to `true` and the encoder writes
 /// `string` bytes verbatim.
