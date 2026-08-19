@@ -81,6 +81,21 @@ pub const STRICT_UTF8 = @import("utf8.zig").STRICT_UTF8;
 /// (MESSAGE_SPEC §3).
 pub const arrays = @import("arrays.zig");
 
+/// Storage for a `count: N` native array field: `N` elements of inline capacity
+/// plus the length actually carried, because a schema `count` is a capacity and
+/// the wire count is the length (MESSAGE_SPEC §3). The capacity is a type
+/// parameter, so the type is schema-free like everything else here.
+pub const FixedArray = @import("support.zig").FixedArray;
+/// Flush sink behind a generated one-shot `encode()`: it collects the drained
+/// bytes into a list allocated from the caller's allocator. The corelib
+/// allocates no output buffer of its own — CORELIB_PLAN §5.1 assigns that to
+/// the generated layer, and this is the mechanism it drives, not a policy.
+pub const CollectingSink = @import("support.zig").CollectingSink;
+/// Accumulator a generated decoder holds for a `string`/`blob` payload split
+/// across feed chunks: it stitches the pieces and hands the completed payload
+/// back as its own allocation.
+pub const PayloadAcc = @import("support.zig").PayloadAcc;
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("varint.zig");
@@ -88,4 +103,5 @@ test {
     _ = @import("istream.zig");
     _ = @import("arrays.zig");
     _ = @import("utf8.zig");
+    _ = @import("support.zig");
 }
