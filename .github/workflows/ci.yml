@@ -139,7 +139,11 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 20   # ~2 min observed, dominated by the kcov source build
-    needs: [build]
+    # Deliberately not `needs: [build]`. This job builds and runs everything
+    # itself under kcov, so it uses nothing that job produces. Waiting for it
+    # started coverage at +204 s on the last run and ended it at +384, while
+    # every other job was done by +293.
+    needs: [lint]
     permissions:
       contents: write   # push the badge JSON to the `badges` branch
     steps:
@@ -149,11 +153,12 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       # kcov is not packaged for Ubuntu 24.04 — build the pinned release.
-      - name: Build kcov
+      # kcov is pinned to v43 and was rebuilt from source on every run: 149 of
+      # this job's 180 seconds went into that, against 10 seconds of actual
+      # measuring. The build tree is cached on the version now, so a hit skips
+      # the download, the cmake configure and the compile.
+      - name: Install kcov's build and runtime dependencies
         run: |
-          # Both network fetches are retried: apt and the GitHub tarball are the
-          # two steps here that can hang or fail transiently. The compile below
-          # is local work and needs no retry.
           ok=
           for i in 1 2 3; do
             if sudo apt-get update && sudo apt-get install -y \
@@ -163,6 +168,17 @@ jobs:
             sleep 15
           done
           [ -n "$ok" ] || { echo "::error::giving up after 3 apt attempts"; exit 1; }
+
+      - name: Cache the kcov build
+        id: kcov-cache
+        uses: actions/cache@v6
+        with:
+          path: /tmp/kcov-43/build
+          key: kcov-43-${{ runner.os }}
+
+      - name: Build kcov
+        if: steps.kcov-cache.outputs.cache-hit != 'true'
+        run: |
           ok=
           for i in 1 2 3; do
             if curl -fsSL https://github.com/SimonKagstrom/kcov/archive/refs/tags/v43.tar.gz | tar xz -C /tmp; then ok=1; break; fi
@@ -172,7 +188,13 @@ jobs:
           [ -n "$ok" ] || { echo "::error::giving up after 3 download attempts"; exit 1; }
           cmake -S /tmp/kcov-43 -B /tmp/kcov-43/build -DCMAKE_BUILD_TYPE=Release
           make -C /tmp/kcov-43/build -j"$(nproc)"
+
+      # Runs on a cache hit too: the cache holds the build tree, not the
+      # installed binary.
+      - name: Install kcov
+        run: |
           sudo make -C /tmp/kcov-43/build install
+          kcov --version
 
       - name: Measure coverage
         run: |
