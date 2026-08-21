@@ -16,10 +16,14 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
+# Both jobs are bounded in time. A hung step must fail fast and name itself:
+# the account's Actions concurrency is 20, and one wedged job — held for
+# GitHub's default six hours — is a slot everyone else waits on.
 jobs:
   build:
     name: Build Zig autodoc
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # ~25 s observed
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
@@ -39,6 +43,7 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10   # ~10 s observed; the Pages API call is the only wait
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
