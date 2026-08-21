@@ -34,8 +34,14 @@ tools use the Linux process-CPU clock.
 Add the package to your project and wire up the `sofab` module:
 
 ```bash
-zig fetch --save git+https://github.com/sofa-buffers/corelib-zig
+zig fetch --save git+https://github.com/sofa-buffers/corelib-zig#v0.10.0
 ```
+
+Pin the release with the `#`-ref. Without one, `zig fetch` resolves whatever
+the default branch happens to point at *at that moment*, so the same command
+run on two days can save two different packages. `--save` writes the resolved
+hash into your own `build.zig.zon` either way — the ref decides what that hash
+ends up pinning.
 
 ```zig
 // build.zig
