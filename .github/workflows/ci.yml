@@ -155,8 +155,16 @@ jobs:
       # kcov is not packaged for Ubuntu 24.04 — build the pinned release.
       # kcov is pinned to v43 and was rebuilt from source on every run: 149 of
       # this job's 180 seconds went into that, against 10 seconds of actual
-      # measuring. The build tree is cached on the version now, so a hit skips
-      # the download, the cmake configure and the compile.
+      # measuring. The source+build tree is cached on the version now, so a
+      # hit skips the download, the cmake configure and the compile.
+      #
+      # The whole /tmp/kcov-43 tree is cached, not just its build/
+      # subdirectory: the Install step below always runs `make install`,
+      # which reruns CMake's cmake_check_build_system regardless of cache
+      # state, and that needs CMakeLists.txt under /tmp/kcov-43 to exist.
+      # Caching build/ alone restored a build tree pointing at a source
+      # directory that was never there, and `make install` failed with
+      # "The source directory ... does not appear to contain CMakeLists.txt."
       - name: Install kcov's build and runtime dependencies
         run: |
           ok=
@@ -173,8 +181,8 @@ jobs:
         id: kcov-cache
         uses: actions/cache@v6
         with:
-          path: /tmp/kcov-43/build
-          key: kcov-43-${{ runner.os }}
+          path: /tmp/kcov-43
+          key: kcov-43-${{ runner.os }}-v2
 
       - name: Build kcov
         if: steps.kcov-cache.outputs.cache-hit != 'true'
