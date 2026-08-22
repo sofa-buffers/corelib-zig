@@ -37,11 +37,9 @@ Add the package to your project and wire up the `sofab` module:
 zig fetch --save git+https://github.com/sofa-buffers/corelib-zig#v0.10.0
 ```
 
-Pin the release with the `#`-ref. Without one, `zig fetch` resolves whatever
-the default branch happens to point at *at that moment*, so the same command
-run on two days can save two different packages. `--save` writes the resolved
-hash into your own `build.zig.zon` either way — the ref decides what that hash
-ends up pinning.
+Pin the release with the `#`-ref: without one, `zig fetch` resolves whatever
+the default branch points at just then. `--save` writes the resolved hash into
+your `build.zig.zon` either way.
 
 ```zig
 // build.zig
@@ -53,8 +51,7 @@ exe.root_module.addImport("sofab", corelib.module("sofab"));
 const sofab = @import("sofab");
 ```
 
-The package name is `sofa_buffers_corelib` (the family's `sofa-buffers` +
-`corelib` naming, delimited as a Zig identifier); the importable namespace is
+The package name is `sofa_buffers_corelib`; the importable namespace is
 `sofab`.
 
 ### Dependencies
@@ -99,10 +96,9 @@ const message = buf[0..os.bytesUsed()];
 ```
 
 Nested scopes are opened with `writeSequenceBeginLazy(id)`, which **holds the
-header back** until the sequence turns out to have content — that is what lets
-the message layer omit an all-default sequence without ever buffering the
-sub-message (MESSAGE_SPEC §2, CORELIB_PLAN §6). Which closer you use is a
-property of the *position*, decided at generation time, not of the value:
+header back** until the sequence turns out to have content, so an all-default
+sequence is omitted without ever buffering the sub-message. Which closer you
+use is a property of the *position*, decided at generation time:
 
 ```zig
 try os.writeSequenceBeginLazy(4);
@@ -120,26 +116,13 @@ try os.writeSequenceEnd(); // struct/union field, or an array field:
 
 `writeSequenceEndKeep` behaves like a write: it emits the held-back headers and
 the end marker, so a contentless sequence still reaches the wire as
-`begin` + `end`. It is the safe default when a call site is ambiguous — using it
-where `writeSequenceEnd` would do costs one non-canonical empty frame that every
-decoder normalizes away, while the reverse drops an array element and silently
-changes the decoded array's **length** (MESSAGE_SPEC §5.1).
+`begin` + `end`. It is the safe default where a call site is ambiguous.
 
-**How deep the hold-back reaches.** All the way: up to `MAX_DEPTH` (255), the
-format's own nesting ceiling. There is no window past which this encoder gives
-up and frames eagerly, so a sequence closed contentless is omitted at *every*
-depth and the bytes are canonical everywhere (CORELIB_PLAN §6). The price is
-paid in the struct rather than on the heap — the run is reserved inline, 255
-ids, so an `OStream` value is 1080 bytes on a 64-bit target and still allocates
-nothing. Only a heap-free profile is allowed to bound the run instead, and then
-it must publish the bound, because two encoders that disagree about it disagree
-about bytes; this port has no bound to publish.
-
-Held-back ids are encoder state, never buffer content, so a pending run cannot
-straddle a flush — a run costs no buffer space, and the buffer only fills
-through a write, which commits the run before its first byte. Output is
-therefore buffer-size independent: a tiny output buffer produces exactly the
-one-shot bytes.
+The hold-back reaches `MAX_DEPTH` (255), the format's own nesting ceiling: this
+encoder never falls back to eager framing, so a contentless sequence is omitted
+at *every* depth. The run is reserved inline in the `OStream` value (see
+[Memory handling](#memory-handling)), and held-back ids are encoder state rather
+than buffer content, so a pending run cannot straddle a flush.
 
 ### Serialize stream
 
@@ -208,28 +191,25 @@ _ = try sofab.decode(message, &sink); // .complete at a clean message boundary
 
 **Nested scopes: declaring `sequenceBegin` is what opts you in.** Every sequence
 opens a **fresh id namespace** — a child's `id 1` is unrelated to the enclosing
-scope's `id 1` — so a visitor that declares no `sequenceBegin` is never told a
-scope was entered and could not tell the two apart. For such a visitor the
-decoder therefore consumes and discards the **entire sub-sequence**, children and
-the matching `sequenceEnd` alike (CORELIB_PLAN §5.2/§6), and the visitor sees the
-message's top-level fields only. Declare `sequenceBegin` (as generated code
-always does) and you get every nested field instead, with the scope bookkeeping
-yours to do. Either way the skipped bytes are still fully parsed: `MAX_DEPTH`,
-every malformed-input verdict and the resync onto the field after the scope are
-unaffected, and the outcome does not depend on where the chunk boundaries fall.
+scope's `id 1`. A visitor that declares no `sequenceBegin` has the decoder
+consume and discard the **entire sub-sequence**, children and the matching
+`sequenceEnd` alike, and sees the message's top-level fields only; declare it
+(as generated code always does) and you get every nested field, with the scope
+bookkeeping yours to do. Either way the skipped bytes are still fully parsed:
+`MAX_DEPTH`, every malformed-input verdict and the resync onto the field after
+the scope are unaffected, and the outcome does not depend on where the chunk
+boundaries fall.
 
 ### Deserialize stream
 
 `IStream.feed` takes chunks of any size, suspends/resumes at any byte boundary,
-and drives the same visitor — so it decodes whatever the transport hands you.
-`feed` returns the message-boundary `Status` after each chunk (`status()`
-re-queries it without feeding more): `.complete` at a clean field boundary and
-`.incomplete` when the bytes ended inside a field or with a sequence still open.
-There is **no** `finish()`/`finalize()` call — the outcome comes straight out of
-`feed(chunk)→status`. Truncation is **not** an error the decoder invents — the
+and drives the same visitor. `feed` returns the message-boundary `Status` after
+each chunk (`status()` re-queries it without feeding more): `.complete` at a
+clean field boundary and `.incomplete` when the bytes ended inside a field or
+with a sequence still open. There is **no** `finish()`/`finalize()` call. The
 caller owns end-of-input and decides, from its own framing, whether a trailing
-`.incomplete` is a truncation failure (MESSAGE_SPEC §7). Malformed bytes are
-still rejected as `error.InvalidMessage` by `feed` itself.
+`.incomplete` is a truncation failure; malformed bytes are rejected as
+`error.InvalidMessage` by `feed` itself.
 
 ```zig
 var sink: My = .{};
@@ -245,25 +225,21 @@ switch (status) { // == is.status()
 }
 ```
 
-**A rejection is terminal.** `error.InvalidMessage` means the consumed bytes are
-malformed *regardless of what follows* (CORELIB_PLAN §5.2), so the decoder
-latches that verdict instead of resynchronizing on whatever comes after the
-malformed construct: every further `feed` — a whole valid message, a truncated
-prefix and an empty end-of-input probe alike — returns `error.InvalidMessage`
-again, and `status()` reports the third `Status`, `.invalid`. That is the only
-way `.invalid` is ever observed, since `feed`/`decode` surface the outcome as the
-error itself. Without the latch the verdict would depend on where the chunk
-boundaries happened to fall — the same bytes must decode to the same outcome fed
-whole or one byte at a time (MESSAGE_SPEC §7.2). `is.reset()` clears the latch —
-it is the only way out — and readies the decoder for the next message.
+**A rejection is terminal.** The decoder latches `error.InvalidMessage` rather
+than resynchronizing after the malformed construct: every further `feed` — a
+whole valid message, a truncated prefix and an empty end-of-input probe alike —
+returns `error.InvalidMessage` again, and `status()` reports the third `Status`,
+`.invalid`. That is the only way `.invalid` is ever observed, since
+`feed`/`decode` surface the outcome as the error itself. `is.reset()` clears the
+latch — the only way out — and readies the decoder for the next message.
 
 The error set also carries `error.LimitExceeded`, for a **receiver-configured**
 decode limit on an unbounded field (`max_dyn_array_count`, `max_dyn_string_len`,
-`max_dyn_blob_len`). This corelib never raises it and defines no default limits —
+`max_dyn_blob_len`). This corelib never raises it and defines no default limits:
 the caps come from the sofabgen config and are enforced in generated decode code,
-which raises this category before allocating. It is deliberately distinct from
-`error.InvalidMessage`: exceeding a receiver limit is policy, not wire
-malformation (see [`generator#102`](https://github.com/sofa-buffers/generator/issues/102)).
+which raises this category before allocating. It is distinct from
+`error.InvalidMessage` — a receiver limit is policy, not wire malformation (see
+[`generator#102`](https://github.com/sofa-buffers/generator/issues/102)).
 
 ### UTF-8 validation (`SOFAB_STRICT_UTF8`)
 
@@ -279,17 +255,15 @@ zig build test -Dstrict_utf8=false   # non-strict build (validation compiled out
 Zig is a **byte-container** target (a string is `[]const u8`), so the corelib
 exposes the primitive `sofab.utf8Valid(bytes: []const u8) bool`. Generated
 decode code calls it **unconditionally** on every materialized `string`; the gate
-lives inside the primitive, so flipping the flag never regenerates code and
-generated code is identical across build configurations. On the encode side,
-`OStream.writeString` refuses a non-UTF-8 value with `error.InvalidArgument` under
-strict — and so does the generic `OStream.writeFixlen(id, data, .string)`, which
-is where the check lives, so every path that can put a `string`-subtype field on
-the wire is covered (`blob` and the float subtypes are never validated).
-`sofab.STRICT_UTF8` reflects the compiled state. When the option is off,
-`utf8Valid` folds to `true` (zero cost, no validator compiled in) and both
-writers emit bytes verbatim — never silent/lossy. Skipped fields are
-never validated. The validator is a real one (rejects overlong forms including
-`C0 80`, surrogates, and code points above `U+10FFFF`; accepts embedded `U+0000`).
+lives inside the primitive, so flipping the flag never regenerates code. On the
+encode side the check lives in `OStream.writeFixlen(id, data, .string)`, so both
+it and `OStream.writeString` refuse a non-UTF-8 value with
+`error.InvalidArgument` under strict (`blob` and the float subtypes are never
+validated). `sofab.STRICT_UTF8` reflects the compiled state. When the option is
+off, `utf8Valid` folds to `true` (no validator compiled in) and both writers emit
+bytes verbatim — never silent/lossy. Skipped fields are never validated. The
+validator rejects overlong forms including `C0 80`, surrogates, and code points
+above `U+10FFFF`, and accepts embedded `U+0000`.
 
 ### Code generator
 
@@ -299,9 +273,7 @@ typed structs whose surface is the closed name set of CORELIB_PLAN §6.1.1 — t
 one-shot `encode()` / `decode()` pair users reach for, and the streaming
 `serialize()` / `deserialize` pair that talks to this corelib (`deserialize`
 being, in Zig, the generated visitor the decoder calls). The one-shot helpers
-are thin wrappers over the streaming path, not a second implementation of it,
-and there is no second spelling for either — the words are fixed, only the
-casing follows the language.
+are thin wrappers over the streaming path.
 
 `sofabgen --lang zig` over a two-field schema
 
@@ -476,21 +448,18 @@ st = try dec.feed(wire[1..]); // .complete — ended on a field boundary
 try dec.finish(); // end-of-input: a trailing .incomplete fails here
 ```
 
-`feed` never says the *message* is done — only that the bytes handed in ended on
-a field boundary or mid-field — so `finish()` is where the generated layer turns
-a trailing `.incomplete` into `error.IncompleteMessage`. Both blocks are
-compiled and run by the test suite (`tests/readme_generated_example.zig`), and
-`tests/readme_tests.zig` fails the build if this section drifts from them.
+`feed` reports only whether the bytes handed in ended on a field boundary, so
+`finish()` is where the generated layer turns a trailing `.incomplete` into
+`error.IncompleteMessage`. Both blocks are compiled and run by the test suite
+(`tests/readme_generated_example.zig`), and `tests/readme_tests.zig` fails the
+build if this section drifts from them.
 
-## Support layer for generated code
+### Support layer for generated code
 
-Not every line a generator emits is about the schema it was generated from. A
-bounded array field needs storage, a one-shot `encode()` needs somewhere to put
-the bytes it produces, an announced element count needs a growth policy, and a
-payload split across feed chunks needs stitching back together — none of which
-changes shape from one schema to the next. That code lives here rather than in
-every generated module (ARCHITECTURE §8): the capacity is a type parameter, and
-the count, the allocator and the payload length are arguments.
+The parts of generated code that do not change shape from one schema to the next
+live here rather than in every generated module (ARCHITECTURE §8): the capacity
+is a type parameter, and the count, the allocator and the payload length are
+arguments.
 
 | symbol | what it holds |
 |---|---|
@@ -500,23 +469,19 @@ the count, the allocator and the payload length are arguments.
 | `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `allocCapped` |
 | `sofab.arrays.ARRAY_INIT_CAP` | the ceiling on what an *announced* element count may claim up front: 1024 elements |
 
-Two of them are worth spelling out here.
-
 **`FixedArray` keeps its storage to itself**, so a length can never be left
-disagreeing with the elements beside it: build a value with `init`/`set`, fill
-one from the wire with `clear`/`push`, read it with `slice()`/`len()`. A schema
-`count` is a **capacity** and the wire count is the length (MESSAGE_SPEC §3), so
-`.{}` is the empty array and `.init(&.{ 10, 20 })` is a two-element value in a
-four-element field. An element past `N` sets the caller's `inv` flag — a wire
-count above the schema count is `INVALID`, never clamped (§7.1).
+disagreeing with the elements beside it. A schema `count` is a **capacity** and
+the wire count is the length, so `.{}` is the empty array and
+`.init(&.{ 10, 20 })` is a two-element value in a four-element field. An element
+past `N` sets the caller's `inv` flag — a wire count above the schema count is
+`INVALID`, never clamped.
 
-**`CollectingSink` does not move who allocates.** CORELIB_PLAN §5.1 assigns
-output-buffer allocation to the generated layer, and this is a sink the caller
-constructs with its own allocator and installs like any other flush target: the
-corelib supplies the mechanism, never the policy. It is the unbounded-schema
-shape — where `MAX_SIZE` is a configured ceiling rather than a size the message
-cannot reach. A schema whose bound is real needs no sink at all: allocate that
-many bytes, install them with `OStream.init`, encode in one pass.
+**`CollectingSink`** is a sink the caller constructs with its own allocator and
+installs like any other flush target; the corelib still allocates nothing. It is
+for the unbounded-schema shape, where `MAX_SIZE` is a configured ceiling rather
+than a size the message cannot reach. A schema whose bound is real needs no sink
+at all: allocate that many bytes, install them with `OStream.init`, encode in one
+pass.
 
 ```zig
 var sink: sofab.CollectingSink = .{ .alloc = alloc };
@@ -545,8 +510,8 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
   callback the buffer drains and is reused (`bufferSet` swaps in a fresh one),
   and `initOffset` reserves leading framing space. Each write copies its bytes
   into the buffer, so caller source strings/slices may be reused immediately.
-  A sink is never handed memory other than the output buffer — this port does
-  not pass `string`/`blob` payloads through.
+  A sink is never handed memory other than the output buffer: this port grants
+  no `string`/`blob` pass-through.
   **`sofab.MIN_OUTPUT_BUFFER` is `1`:** the smallest buffer accepted **for
   streaming**, i.e. one installed together with a flush sink, which must offer
   at least that many usable bytes (`buffer.len - offset`). A buffer installed
@@ -557,29 +522,21 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
   through a message: an offset past the end of the buffer, or less than
   `MIN_OUTPUT_BUFFER` behind a sink, is refused there and leaves the stream
   inert, writing nothing and reporting `error.InvalidArgument` from every write.
-  `initOffsetChecked` / `initFlushChecked` / `bufferSetChecked` are the same
-  installations reported as an error status up front, for a buffer or offset
-  computed at runtime.
+  The `*Checked` variant of each of those three reports the same refusal as an
+  error status up front, for a buffer or offset computed at runtime.
   **What the flush callback does before it returns decides where the encoder
-  goes on writing.** A sink may *copy* the bytes it was handed or *take* the
-  buffer — hand it to a transport, queue it for an asynchronous write — and the
-  encoder cannot tell the two apart, so the callback states which it is:
-  returning **without** installing a buffer means it copied, and the active
-  buffer stays active with the cursor back at **0**; a sink that **takes** the
-  buffer must `bufferSet` a replacement before returning. The start offset
-  belongs to that installation, not to the buffer, so the encoder resumes at
-  *that call's* offset — `os.bufferSet(fresh, 4)` re-arms four bytes of header
-  room in the next flushed unit. Installing the **same** buffer is a new
-  installation like any other: that is how a sink gets fresh framing room in
-  **every** unit, one header per packet, where a bare return would give it only
-  in the first. The offset is consumed by the installation, so a later bare
-  return resumes at 0 again. A replacement refused inside a callback leaves the
-  stream inert like any other refusal, and the write that triggered the flush
+  goes on writing.** Returning **without** installing a buffer means the sink
+  copied the bytes: the active buffer stays active, with the cursor back at
+  **0**. A sink that **takes** the buffer must `bufferSet` a replacement before
+  returning. The start offset belongs to the installation, not to the buffer, so
+  the encoder resumes at *that call's* offset — `os.bufferSet(fresh, 4)` re-arms
+  four bytes of header room in the next flushed unit, and re-installing the
+  **same** buffer is how a sink gets that room in every unit rather than only in
+  the first. A later bare return resumes at 0 again. A replacement refused inside
+  a callback leaves the stream inert, and the write that triggered the flush
   reports `error.InvalidArgument` instead of storing into it.
   The struct itself is 1080 bytes on a 64-bit target: it reserves the full
-  `MAX_DEPTH` lazy sequence hold-back run inline (see
-  [Serialize](#serialize)), which is what buys canonical framing at every depth
-  without an allocator. Put it wherever you would put a 1 KiB local.
+  `MAX_DEPTH` lazy sequence hold-back run inline (see [Serialize](#serialize)).
 - **Decode (`decode` / `IStream` + visitor):** you own the input buffer and it
   must outlive the `decode`/`feed` call. A `string`/`blob` chunk is a borrowed
   slice; where it borrows from — and therefore how long it stays valid — depends
@@ -587,15 +544,12 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
   - **`decode` (whole message in one buffer):** every delivered slice points
     directly into the caller's input buffer, and is **valid for that buffer's
     lifetime** — you may retain it as long as you keep the input buffer alive,
-    not merely for the duration of the callback. This is the guarantee the
-    zero-copy decode rests on: a decoded value can hold a `[]const u8` view into
-    your buffer with no copy.
+    not merely for the duration of the callback.
   - **`feed` (streaming, chunk by chunk):** a delivered slice is **valid only
     during that callback** — copy it out to keep it. It usually points into the
     chunk you just fed, but a payload that straddled a chunk boundary is
     stitched together in `IStream`'s internal carry buffer and delivered as a
-    slice into *that*, which the next stitched item overwrites. Do not assume a
-    `feed`-delivered slice lives in your own chunk.
+    slice into *that*, which the next stitched item overwrites.
 
 | Buffer | Owner / lifetime |
 |--------|------------------|
@@ -603,18 +557,9 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
 | **Input buffer (`decode`)** | Caller-owned; must outlive the call. Delivered string/blob slices borrow from it and stay valid for its whole lifetime — retainable, not callback-scoped. |
 | **Input chunk (`feed`)** | Caller-owned; must outlive the call. Delivered string/blob slices are valid only during the callback; a carry-completed payload borrows from `IStream`, not from your chunk. |
 
-This is a **push / visitor** model, so there is no address-stability requirement
-on decoded values. The only memory the decoder owns is `IStream`'s fixed 64-byte
+Decoded values are pushed to a visitor, so nothing requires them to be
+address-stable. The only memory the decoder owns is `IStream`'s fixed 64-byte
 carry buffer — the few bytes of an item that straddled a chunk boundary.
-
-## Feature flags
-
-The wire format is always fully supported — there are no toggles for wire types.
-The one build option is the strict UTF-8 validation policy:
-
-| Build option | Default | Effect |
-|--------------|---------|--------|
-| `-Dstrict_utf8=<bool>` (`SOFAB_STRICT_UTF8`) | `true` (on) | Strict UTF-8 validation of `string` fields — see [UTF-8 validation](#utf-8-validation-sofab_strict_utf8). Off compiles the validator out (zero cost) and stores/writes bytes verbatim. A validation policy only, never a wire-format switch. |
 
 ## Build & test
 
@@ -626,10 +571,21 @@ zig build test --release=fast    # the same suite in the shipping config
 ```
 
 CI runs `zig fmt --check`, the full suite in Debug and ReleaseFast, the same
-suite on a **big-endian** s390x host under QEMU, and the kcov coverage job.
-Conformance tests live in `tests/` (shared-vector replay, chunked encode/decode,
-roundtrip, malformed-input, cross-chunk UTF-8 and skip scenarios); unit tests
-live next to the code in `src/`.
+suite on a **big-endian** s390x host under QEMU and on a 32-bit x86 target in
+both modes, and the kcov coverage job. Conformance tests live in `tests/`
+(shared-vector replay, chunked encode/decode, roundtrip, malformed-input,
+cross-chunk UTF-8 and skip scenarios); unit tests live next to the code in
+`src/`.
+
+### Feature flags
+
+There are no toggles for wire types. The one build option is the strict UTF-8
+validation policy:
+
+| Build option | Default | Effect |
+|--------------|---------|--------|
+| `-Dstrict_utf8=<bool>` (`SOFAB_STRICT_UTF8`) | `true` (on) | Strict UTF-8 validation of `string` fields — see [UTF-8 validation](#utf-8-validation-sofab_strict_utf8). Off compiles the validator out (zero cost) and stores/writes bytes verbatim. A validation policy only, never a wire-format switch. |
+
 
 ## Benchmarks
 
@@ -650,23 +606,18 @@ bash bench/run_callgrind.sh      # instructions/op (Callgrind Ir/op)
 ~1 s process-CPU-time loop.
 
 `bench/run_callgrind.sh` reports **instructions retired per op** (`Ir/op`) under
-Callgrind — deterministic and independent of clock speed and scheduler, so the
-numbers compare across machines and against the sibling ports, and unlike
-`perf`'s cycle counter the measurement is available on every target. It needs
-`valgrind` installed — the devcontainer image ships it — and builds its tool
-(`zig build callgrind`) itself;
-collection is toggled on that tool's `run_<workload>` symbol, so each printed
-number is one operation's cost directly, with no rep-count subtraction. It is
-measurement tooling for reporting, not part of the test suite or CI.
+Callgrind — deterministic, independent of clock speed and scheduler, and
+available on every target, unlike `perf`'s cycle counter. It needs `valgrind`
+installed (the devcontainer image ships it) and builds its own tool
+(`zig build callgrind`); collection is toggled on that tool's `run_<workload>`
+symbol, so each printed number is one operation's cost with no rep-count
+subtraction. It is reporting tooling, not part of the test suite or CI.
 
 All three tools drive **one** list of workloads — the table in
 `bench/workloads.zig` — so the MB/s rows, the per-op report and the Ir/op rows
-measure the same code on the same data, and a workload cannot exist in one tool
-and be missing from another. `tests/bench_spec_tests.zig` holds that table
-against BENCH_SPEC's rows and runs every entry, including the two encoded sizes
-the spec states outright (`blob 1MB` = 1,000,005 bytes, `composite` = 956), so a
-workload that quietly stops encoding what the family encodes fails the test
-suite instead of printing a plausible number.
+measure the same code on the same data. `tests/bench_spec_tests.zig` holds that
+table against BENCH_SPEC's rows and runs every entry, including the two encoded
+sizes the spec states outright (`blob 1MB` = 1,000,005 bytes, `composite` = 956).
 
 ### What the numbers look like
 
@@ -687,27 +638,19 @@ decode: composite               2334.60             5 381      956
 decode: composite skip-all      2326.25             5 319      956
 ```
 
-Three of those rows say something other than what they look like:
+Three of those rows have to be read against their configuration:
 
-* **The `blob 1MB` rows are read against each other, never alone.** Five bytes
-  of that message are metadata and a million are payload, so its MB/s is the
-  host's memory bandwidth. The signal is the gap between the one-shot row (one
-  contiguous write into a caller buffer, no sink) and the streaming row (the
-  same megabyte through a 4096-byte buffer with a flush sink, ~245 flushes):
-  under `Ir/op` the divisible-run path of §5.1 costs **+13 %** here, because the
-  encoder hands each buffer-sized run to `@memcpy` rather than falling back to a
-  byte-at-a-time loop. Under MB/s the streaming row is *faster* than the
-  one-shot row — a 4 KiB buffer stays in L1 while a contiguous megabyte does
-  not, which is bandwidth talking, not the encoder. BENCH_SPEC's optional
-  `blob 1MB passthrough` row is absent because this port grants no pass-through
-  permission.
-* **`decode: blob 1MB` at 30 255 Ir for a megabyte is not a fast copy — it is no
-  copy.** Decoding hands the visitor a slice borrowed from the input buffer, so
-  the work is walking the framing of 245 chunks and nothing ever touches the
-  payload. That is the zero-copy design showing up as a measurement, and it is
-  why the row reports hundreds of GB/s instead of memory bandwidth.
+* **The `blob 1MB` rows are read against each other.** Five bytes of that
+  message are metadata and a million are payload, so their MB/s is the host's
+  memory bandwidth, and the 4 KiB streaming buffer stays in L1 where a
+  contiguous megabyte does not. The two encode rows differ only in the sink: one
+  contiguous write into a caller buffer, against the same megabyte through a
+  4096-byte buffer and ~245 flushes, which costs **+13 %** `Ir/op`. BENCH_SPEC's
+  optional `blob 1MB passthrough` row is absent — this port grants no
+  pass-through.
+* **`decode: blob 1MB` never touches the payload.** The visitor is handed a
+  slice borrowed from the input buffer, so its 30 255 `Ir` is the framing of 245
+  chunks alone.
 * **`decode: composite skip-all` is barely cheaper than `decode: composite`.**
   Skipping suppresses delivery, not parsing: every header, length word and count
-  is still walked, and a visitor that declares no callback saves the handful of
-  adds the checksum visitor would have done. The saving is in what the
-  *application* then does not have to do.
+  is still walked.
