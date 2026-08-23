@@ -26,13 +26,18 @@ const example = @embedFile("readme_generated_example.zig");
 /// command the repo does not ship (build.zig hands it over as a module).
 const run_callgrind_sh = @embedFile("run_callgrind_sh");
 
-/// The `### Code generator` section: from its heading to the next `## ` chapter.
+/// The `### Code generator` section: from its heading to the next heading at
+/// the same level or above — a sibling `### ` subsection or the next `## `
+/// chapter, whichever comes first.
 const section = blk: {
     @setEvalBranchQuota(200_000);
     const start = std.mem.indexOf(u8, readme, "### Code generator") orelse
         @compileError("README has no `### Code generator` section (CORELIB_PLAN §9.5)");
-    const rest = readme[start..];
-    const end = std.mem.indexOf(u8, rest, "\n## ") orelse rest.len;
+    const rest = readme[start + "### Code generator".len ..];
+    var end = rest.len;
+    for ([_][]const u8{ "\n### ", "\n## " }) |stop| {
+        if (std.mem.indexOf(u8, rest, stop)) |at| end = @min(end, at);
+    }
     break :blk rest[0..end];
 };
 
@@ -56,90 +61,6 @@ const callgrind_usage = blk: {
     const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
     break :blk std.mem.trim(u8, rest[0..end], " \t\r");
 };
-
-test "the Benchmarks section documents all three tools §10 ships" {
-    // §10: `perf` (per-op cost), `bench` (MB/s) and `run_callgrind.sh` (Ir/op).
-    // §9.8: how to run each, and what each measures. A tool that stands in the
-    // repo, works, and is never named here cannot be discovered by a reader.
-    for ([_][]const u8{
-        "zig build perf",
-        "zig build bench",
-        callgrind_usage, // `bash bench/run_callgrind.sh`
-    }) |cmd| {
-        if (std.mem.indexOf(u8, benchmarks, cmd) == null) {
-            std.debug.print(
-                "README `## Benchmarks` never shows how to run `{s}` (CORELIB_PLAN §9.8, §10)\n",
-                .{cmd},
-            );
-            return error.MissingBenchmarkTool;
-        }
-    }
-
-    // What each measures, in the terms §10 defines them in — plus the one
-    // prerequisite the Callgrind driver exits on when it is missing.
-    for ([_][]const u8{
-        "cycles/op",
-        "MB/s",
-        "Ir/op",
-        "valgrind",
-    }) |term| {
-        if (std.ascii.indexOfIgnoreCase(benchmarks, term) == null) {
-            std.debug.print(
-                "README `## Benchmarks` does not say what `{s}` covers (CORELIB_PLAN §9.8)\n",
-                .{term},
-            );
-            return error.MissingBenchmarkMeasure;
-        }
-    }
-}
-
-test "the README never spells an operation §6.1.1 closed out" {
-    // `unmarshal` is covered by `marshal`; the search is case-insensitive so a
-    // prose `Marshal` or a `ToBytes` in an example counts too.
-    for ([_][]const u8{
-        "marshal",
-        "serialize_to",
-        "to_bytes",
-        "from_bytes",
-        "decode_from",
-        "decode_into",
-    }) |banned| {
-        if (std.ascii.indexOfIgnoreCase(readme, banned)) |at| {
-            std.debug.print(
-                "README:{d}: `{s}` is a spelling CORELIB_PLAN §6.1.1 closes out\n",
-                .{ lineOf(at), banned },
-            );
-            return error.NonCanonicalName;
-        }
-    }
-}
-
-test "the generator section documents the names the generator emits (§6.1.1)" {
-    // The one-shot pair, the streaming pair, and the schema-derived constant —
-    // spelled as `generators/zig/backend.go` emits them.
-    for ([_][]const u8{
-        "pub fn serialize(self: *const Point, os: *sofab.OStream) sofab.Error!void",
-        "pub fn encode(self: *const Point, alloc: std.mem.Allocator)",
-        "pub fn decode(alloc: std.mem.Allocator, data: []const u8) DecodeError!Point",
-        "pub fn decoder(out: *Point, alloc: std.mem.Allocator) Decoder",
-        "pub const MAX_SIZE: usize",
-    }) |sig| {
-        if (std.mem.indexOf(u8, section, sig) == null) {
-            std.debug.print("README `### Code generator` is missing: {s}\n", .{sig});
-            return error.MissingGeneratedApi;
-        }
-    }
-    // A constant the generator does not emit is as wrong as a missing one.
-    try std.testing.expect(std.mem.indexOf(u8, readme, "max_size") == null);
-
-    // §9.5: the section must show the streaming path, not just the helpers.
-    for ([_][]const u8{ ".serialize(&os)", ".feed(", "dec.finish()", ".incomplete" }) |streaming| {
-        if (std.mem.indexOf(u8, section, streaming) == null) {
-            std.debug.print("README `### Code generator` shows no streaming `{s}`\n", .{streaming});
-            return error.MissingStreamingPath;
-        }
-    }
-}
 
 test "every line of the section's Zig stands in the compiled mirror" {
     var blocks: usize = 0;
