@@ -619,24 +619,11 @@ measure the same code on the same data. `tests/bench_spec_tests.zig` holds that
 table against BENCH_SPEC's rows and runs every entry, including the two encoded
 sizes the spec states outright (`blob 1MB` = 1,000,005 bytes, `composite` = 956).
 
-### What the numbers look like
+### How to read the rows
 
-x86-64 (Zig 0.16.0, ReleaseFast, shared runner — MB/s is this machine's figure,
-`Ir/op` is not):
-
-```
-Workload                           MB/s          instr/op    bytes
-encode: u64 array (1000)        3675.02            37 045     9491
-encode: typical message         1253.71               393       37
-encode: blob 1MB one-shot      37385.69           156 370  1000005
-encode: blob 1MB streaming     51192.12           176 651  1000005
-encode: composite                891.86            14 743      956
-decode: u64 array (1000)        3062.40            44 840     9491
-decode: typical message          814.78               664       37
-decode: blob 1MB              574607.31            30 255  1000005
-decode: composite               2334.60             5 381      956
-decode: composite skip-all      2326.25             5 319      956
-```
+Measured figures are not reproduced here — they belong to the cross-language
+benchmark arena, which runs every port on one host under one methodology. This
+section says how to obtain them, not what they came out as.
 
 Three of those rows have to be read against their configuration:
 
@@ -645,11 +632,11 @@ Three of those rows have to be read against their configuration:
   memory bandwidth, and the 4 KiB streaming buffer stays in L1 where a
   contiguous megabyte does not. The two encode rows differ only in the sink: one
   contiguous write into a caller buffer, against the same megabyte through a
-  4096-byte buffer and ~245 flushes, which costs **+13 %** `Ir/op`. BENCH_SPEC's
-  optional `blob 1MB passthrough` row is absent — this port grants no
-  pass-through.
+  4096-byte buffer and ~245 flushes, and the gap between them is what the flush
+  path costs. BENCH_SPEC's optional `blob 1MB passthrough` row is absent — this
+  port grants no pass-through.
 * **`decode: blob 1MB` never touches the payload.** The visitor is handed a
-  slice borrowed from the input buffer, so its 30 255 `Ir` is the framing of 245
+  slice borrowed from the input buffer, so its `Ir/op` is the framing of 245
   chunks alone.
 * **`decode: composite skip-all` is barely cheaper than `decode: composite`.**
   Skipping suppresses delivery, not parsing: every header, length word and count
