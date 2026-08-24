@@ -553,6 +553,7 @@ pub const IStream = struct {
                         // (§4.8).
                         const word = (try varint.readVarint(buf, &pos)) orelse return field_start;
                         const subtype = try FixlenType.fromRaw(@truncate(word));
+                        if (word >> 3 > types.FIXLEN_MAX) return Error.InvalidMessage;
                         const elem_len: usize = @intCast(word >> 3);
                         // Only fixed-width float subtypes are valid in a fixlen
                         // array; string/blob must use a sequence instead.
