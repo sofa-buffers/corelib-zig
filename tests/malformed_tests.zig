@@ -136,6 +136,18 @@ test "oversized lengths and counts are rejected" {
     common.pushVarint(&h, arena, (@as(u64, 1) << 31 << 3) | 0);
     common.pushVarint(&h, arena, 1);
     try expectInvalidWholeAndChunked(h.items);
+
+    // Fixlen-array element length above FIXLEN_MAX: the fixlen_word's length
+    // bits alone exceed 2^31, before any subtype/width check ever runs. On a
+    // 32-bit usize the pre-guard `@intCast` truncated this instead of
+    // rejecting it (2^32 + 4 truncates to 4, a legal fp32 width) — a crash on
+    // Debug/ReleaseSafe and a silent accept on ReleaseFast. This must be
+    // caught here, at the describing word, the same as the scalar case above.
+    var fa: std.ArrayList(u8) = .empty;
+    common.pushVarint(&fa, arena, 0x05); // header: id 0, fixlen array
+    common.pushVarint(&fa, arena, 1); // count
+    common.pushVarint(&fa, arena, ((@as(u64, 1) << 32 | 4) << 3) | 0); // fp32 subtype, oversized length
+    try expectInvalidWholeAndChunked(fa.items);
 }
 
 test "reserved fixlen subtypes and wrong float widths are rejected" {
