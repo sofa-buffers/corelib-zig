@@ -56,15 +56,61 @@ pub fn putChecked(s: anytype, i: *usize, v: std.meta.Elem(@TypeOf(s)), inv: *boo
     i.* += 1;
 }
 
+/// Element capacity of the block backing a `grow`-owned destination of length
+/// `len` — the growth invariant this pair maintains, and the reason neither
+/// helper needs a capacity field the generated destination has nowhere to keep.
+///
+/// **Every block `grow` allocates holds `ceilPowerOfTwo(n)` elements, and the
+/// slice it hands back is the first `n` of them.** The capacity is therefore a
+/// pure function of the length, recoverable on the next call without storing
+/// anything: a destination of length 5 is a prefix of a block of 8, one of
+/// length 8 is a block of exactly 8, and one of length 0 owns nothing.
+///
+/// The fallback matters only above 2^63 elements, where no power of two fits:
+/// the capacity is then the length itself, which simply means every further
+/// extension reallocates. It cannot make the claim too large.
+inline fn capacityFor(len: usize) usize {
+    if (len == 0) return 0;
+    return std.math.ceilPowerOfTwo(usize, len) catch len;
+}
+
 /// Grow a decode-owned slice to `n` elements, filling new slots with `fill`.
 /// Returns false when the allocation fails — the caller then drops the data
 /// rather than writing out of range.
+///
+/// **Geometry (CORELIB_PLAN §7.2 item 8).** The block is extended to *at least*
+/// `n`, never to exactly `n`: a sequence array is filled one element at a time
+/// (`setElem` below), and reallocating on every element costs O(n²) copies —
+/// against the arena of the allocator contract above, which *abandons* the old
+/// block rather than freeing it, those copies are the peak memory, not garbage.
+/// Doubling makes the total O(n) with O(log n) allocations. The slice handed
+/// back is still exactly `n` long, because for a wrapper array that length *is*
+/// the decoded value: highest present id + 1 (MESSAGE_SPEC §5.1). The spare
+/// capacity lives past its end and is claimed, not reallocated, by the next
+/// call — see `capacityFor`.
+///
+/// **Precondition.** The destination is `grow`'s own: it starts empty (`&.{}`,
+/// which generated decode assigns before the array's first element) and is
+/// modified only through `grow` / `setElem` from then on. That is what makes
+/// `capacityFor` true of it. A slice from elsewhere — `allocN`, `allocCapped`,
+/// a literal — belongs to the count-prefixed shape and is grown by `putGrowing`
+/// against a capacity it carries in its own length; the two shapes never mix
+/// (SofaBuffers ARCHITECTURE §9.5).
 pub fn grow(comptime T: type, a: std.mem.Allocator, s: *[]const T, n: usize, fill: T) bool {
-    if (s.*.len >= n) return true;
-    const new = a.alloc(T, n) catch return false;
-    @memcpy(new[0..s.*.len], s.*);
-    @memset(new[s.*.len..], fill);
-    s.* = new;
+    const len = s.*.len;
+    if (len >= n) return true;
+    if (n <= capacityFor(len)) {
+        // The room is already allocated — this is the common case once the
+        // array has any size at all, and it costs a fill of the new slots.
+        const base = @constCast(s.*.ptr);
+        @memset(base[len..n], fill);
+        s.* = base[0..n];
+        return true;
+    }
+    const new = a.alloc(T, capacityFor(n)) catch return false;
+    @memcpy(new[0..len], s.*);
+    @memset(new[len..n], fill);
+    s.* = new[0..n];
     return true;
 }
 
@@ -129,6 +175,10 @@ pub fn allocCapped(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
 /// Place a wrapper-array string/blob element at its wire id (= array index),
 /// growing the destination and filling the id gaps left by omitted default
 /// elements (MESSAGE_SPEC §5.1).
+///
+/// Growth is `grow`'s: the destination ends up exactly `id + 1` long, while the
+/// block behind it doubles, so filling an array element by element costs O(n)
+/// copies rather than O(n²). `grow`'s precondition is this function's too.
 pub fn setElem(comptime T: type, a: std.mem.Allocator, s: *[]const T, id: usize, fill: T, v: T) void {
     if (!grow(T, a, s, id + 1, fill)) return;
     @constCast(&s.*[id]).* = v;
