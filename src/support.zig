@@ -178,10 +178,12 @@ pub const CollectingSink = struct {
 /// Accumulator for one `string`/`blob` payload that arrives in pieces.
 ///
 /// A decode destination wants one contiguous payload, whatever the feed
-/// chunking was. On the one-shot path a payload always arrives whole and the
-/// caller borrows it directly; this is the other case — the chunk boundary that
-/// splits a payload in two — and it holds the pieces until the announced
-/// `total` has arrived.
+/// chunking was. On the one-shot path a payload always arrives whole, so the
+/// callback can copy it in one go; this is the other case — the chunk boundary
+/// that splits a payload in two — and it holds the pieces until the announced
+/// `total` has arrived. Either way the codec's slice dies with the callback
+/// (CORELIB_PLAN §6.7); this accumulator is helper-layer storage that outlives
+/// it because the *generated* layer owns it (§6.6.1).
 ///
 /// The completed payload is handed back as its **own** allocation, never as a
 /// view into this buffer. A destination *keeps* the slice it is given — a

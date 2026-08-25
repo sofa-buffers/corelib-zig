@@ -9,9 +9,11 @@
 //!
 //! The whole library is **allocation-free**: the encoder writes into a
 //! caller-owned buffer (draining to a flush sink when it fills) and the decoder
-//! pushes borrowed slices into a comptime-duck-typed visitor. The only state the
-//! decoder owns is a small fixed carry buffer for the few bytes of an item that
-//! straddles a chunk boundary.
+//! passes each payload through a comptime-duck-typed visitor as a slice that is
+//! valid only until the callback returns — on the one-shot path exactly as on
+//! the streaming one. The only state the decoder owns is a small fixed carry
+//! buffer, sized once in the struct, for the few bytes of an item that straddles
+//! a chunk boundary.
 //!
 //! ## Example
 //!
