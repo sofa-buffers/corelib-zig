@@ -114,8 +114,17 @@ pub fn grow(comptime T: type, a: std.mem.Allocator, s: *[]const T, n: usize, fil
     return true;
 }
 
-/// Allocate a zeroed native-array destination of exactly `n` elements (the wire
-/// count). On allocation failure the array decodes as empty.
+/// Allocate a zeroed native-array destination of exactly `n` elements.
+///
+/// The **A-shape** allocation (SofaBuffers ARCHITECTURE §9.5): everything whose
+/// count or length is on the wire ahead of its payload checks that word and
+/// allocates exactly it, once. `n` is therefore a count the caller has *already*
+/// bounded — against the schema `count` (`INVALID` above it, MESSAGE_SPEC §7.1)
+/// or against the receiver cap on a schema-unbounded field (`LimitExceeded`,
+/// CORELIB_PLAN §6.2.1) — because only generated code knows either number. This
+/// helper commits the memory; it does not decide the bound.
+///
+/// On allocation failure the array decodes as empty.
 pub fn allocN(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
     const s = a.alloc(T, n) catch return &.{};
     @memset(s, std.mem.zeroes(T));
@@ -154,6 +163,10 @@ pub fn at(s: anytype, i: usize) *std.meta.Elem(@TypeOf(s)) {
 /// vector can settle it. It is versioned with the wire code instead, here, next
 /// to the growth policy it belongs to.
 ///
+/// **A constant this library picked, which §6.2.1 says it should not have**:
+/// "The codec never invents a limit of its own." It survives only as long as
+/// `allocCapped` does — see the note there, and `corelib-zig#77`.
+///
 /// In elements rather than bytes, so the worst case scales with the element
 /// width: 1024 `u64`s is 8 KiB of eager storage, and every element a larger
 /// count claims beyond that is paid for only as it actually arrives.
@@ -162,12 +175,26 @@ pub const ARRAY_INIT_CAP: usize = 1024;
 /// Initial storage for a native array announcing `n` wire elements, capped at
 /// `ARRAY_INIT_CAP`.
 ///
-/// The announced count is untrusted until its elements arrive: CORELIB_PLAN
-/// §4.8 has a decoder read `element_count` "allocating nothing on the strength
-/// of that count", so a one-line header claiming `2^31` elements must cost a
-/// bounded allocation and nothing more. `putGrowing` then extends the store as
-/// the elements really arrive, never past `n`. On allocation failure the array
-/// decodes as empty.
+/// **This is the pre-`corelib-zig#77` shape, and its rationale has expired.**
+/// It was written against CORELIB_PLAN §4.8's "allocating nothing on the
+/// strength of that count", which read as *start small and grow*. §4.8.1 now
+/// says "committing no memory on the strength of that count **before it has
+/// been checked** (§6.2.1)" — so the intended shape for anything whose count or
+/// length is on the wire *ahead* of its payload is check-then-allocate-exactly,
+/// once, with the bound coming from generated code (the schema `count`, or the
+/// receiver cap) and never from a constant this library picked (§7.2 item 8,
+/// SofaBuffers ARCHITECTURE §9.5). `allocN` is that helper; `grow`/`setElem`
+/// keep the growth, which stays conformant for the id-keyed sequence-array
+/// shape alone.
+///
+/// It is left standing because removing it is the *codegen* side's move to
+/// sequence: generated code today emits its own `@min(n, 1024)` wrapper and
+/// then stores through `putGrowing`, so retiring either half here before
+/// `generator#386` switches the emission over would silently drop every element
+/// past the cap. Tracked in `corelib-zig#77`.
+///
+/// `putGrowing` extends the store as the elements really arrive, never past
+/// `n`. On allocation failure the array decodes as empty.
 pub fn allocCapped(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
     return allocN(T, a, @min(n, ARRAY_INIT_CAP));
 }
