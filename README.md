@@ -583,9 +583,10 @@ zig build test --release=fast    # the same suite in the shipping config
 CI runs `zig fmt --check`, the full suite in Debug and ReleaseFast, the same
 suite on a **big-endian** s390x host under QEMU and on a 32-bit x86 target in
 both modes, and the kcov coverage job. Conformance tests live in `tests/`
-(shared-vector replay, chunked encode/decode, roundtrip, malformed-input,
-cross-chunk UTF-8 and skip scenarios); unit tests live next to the code in
-`src/`.
+(shared-vector replay including the `sequence_growth` block, chunked
+encode/decode, chunk-lifetime scrubs, roundtrip, malformed-input, tolerance,
+cross-chunk UTF-8, array-growth geometry and skip scenarios); unit tests live
+next to the code in `src/`.
 
 ### Feature flags
 
