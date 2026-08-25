@@ -466,8 +466,7 @@ arguments.
 | `sofab.FixedArray(T, N)` | a `count: N` array field: `N` elements of inline capacity plus the length actually carried |
 | `sofab.CollectingSink` | the flush sink behind a one-shot `encode()`, collecting the drained bytes into the caller's allocator |
 | `sofab.PayloadAcc` | one `string`/`blob` payload arriving in pieces, stitched and handed on as its own allocation |
-| `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `allocCapped` |
-| `sofab.arrays.ARRAY_INIT_CAP` | the ceiling on what an *announced* element count may claim up front: 1024 elements |
+| `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `at` |
 
 **`FixedArray` keeps its storage to itself**, so a length can never be left
 disagreeing with the elements beside it. A schema `count` is a **capacity** and

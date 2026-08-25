@@ -15,20 +15,24 @@
 
 const std = @import("std");
 
-/// Store the next native-array element into a dynamic slice, growing a capped
-/// initial allocation geometrically as the elements actually arrive — never past
-/// the announced wire count `n`.
+/// Store the next native-array element into a dynamic slice, refusing an element
+/// past the announced wire count `n`.
 ///
-/// The counterpart to allocating `n` elements up front: the wire count is
-/// untrusted, so a decoder that believes it would let a one-line header demand
-/// an arbitrary allocation. Starting small and growing to what actually arrives
-/// bounds the cost to the data really sent, while `n` still caps the total. An
-/// element the grow cannot hold (allocation failure) is dropped.
+/// **The A shape** (SofaBuffers ARCHITECTURE §9.5): a native array's count is on
+/// the wire ahead of its payload, so generated code bounds that count — against
+/// the schema `count` (`INVALID`) or the receiver cap (`LimitExceeded`) — and
+/// then allocates exactly it, once, through `allocN`. `n` is that same checked
+/// count, so `s` is already `n` long when the first element arrives and the
+/// growth below is dead: `i >= n` returns before `i >= s.len` can be true.
 ///
-/// **Allocator contract:** each grow abandons the previous block rather than
-/// freeing it, so this expects an arena — the decode allocator generated code
-/// passes in, released as a whole when the message is dropped. Handed a
-/// general-purpose allocator it leaks every intermediate block.
+/// The branch is kept as a floor, not as a policy: a destination shorter than
+/// `n` would otherwise drop elements silently, which is the one outcome
+/// MESSAGE_SPEC §7.1 rules out for an over-count element. It doubles rather than
+/// extending by one, so even reached it is O(n) rather than O(n²).
+///
+/// **Allocator contract:** should the grow run, it abandons the previous block
+/// rather than freeing it, so this expects an arena — the decode allocator
+/// generated code passes in, released as a whole when the message is dropped.
 pub fn putGrowing(s: anytype, a: std.mem.Allocator, i: *usize, n: usize, v: std.meta.Elem(@TypeOf(s.*))) void {
     if (i.* >= n) return;
     if (i.* >= s.*.len) {
@@ -92,10 +96,10 @@ inline fn capacityFor(len: usize) usize {
 /// **Precondition.** The destination is `grow`'s own: it starts empty (`&.{}`,
 /// which generated decode assigns before the array's first element) and is
 /// modified only through `grow` / `setElem` from then on. That is what makes
-/// `capacityFor` true of it. A slice from elsewhere — `allocN`, `allocCapped`,
-/// a literal — belongs to the count-prefixed shape and is grown by `putGrowing`
-/// against a capacity it carries in its own length; the two shapes never mix
-/// (SofaBuffers ARCHITECTURE §9.5).
+/// `capacityFor` true of it. A slice from elsewhere — `allocN`, a literal —
+/// belongs to the count-prefixed shape, which is allocated at its checked count
+/// once and never grown; the two shapes never mix (SofaBuffers ARCHITECTURE
+/// §9.5).
 pub fn grow(comptime T: type, a: std.mem.Allocator, s: *[]const T, n: usize, fill: T) bool {
     const len = s.*.len;
     if (len >= n) return true;
@@ -153,50 +157,6 @@ pub fn allocN(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
 /// rather than merging into the first (§7.4).
 pub fn at(s: anytype, i: usize) *std.meta.Elem(@TypeOf(s)) {
     return @constCast(&s[i]);
-}
-
-/// Ceiling on the storage an *announced* element count may claim up front
-/// (`allocCapped`), in elements.
-///
-/// A DoS policy constant, not a wire one: two decoders may disagree about it
-/// and still accept the same messages and recover the same values, so no shared
-/// vector can settle it. It is versioned with the wire code instead, here, next
-/// to the growth policy it belongs to.
-///
-/// **A constant this library picked, which §6.2.1 says it should not have**:
-/// "The codec never invents a limit of its own." It survives only as long as
-/// `allocCapped` does — see the note there, and `corelib-zig#77`.
-///
-/// In elements rather than bytes, so the worst case scales with the element
-/// width: 1024 `u64`s is 8 KiB of eager storage, and every element a larger
-/// count claims beyond that is paid for only as it actually arrives.
-pub const ARRAY_INIT_CAP: usize = 1024;
-
-/// Initial storage for a native array announcing `n` wire elements, capped at
-/// `ARRAY_INIT_CAP`.
-///
-/// **This is the pre-`corelib-zig#77` shape, and its rationale has expired.**
-/// It was written against CORELIB_PLAN §4.8's "allocating nothing on the
-/// strength of that count", which read as *start small and grow*. §4.8.1 now
-/// says "committing no memory on the strength of that count **before it has
-/// been checked** (§6.2.1)" — so the intended shape for anything whose count or
-/// length is on the wire *ahead* of its payload is check-then-allocate-exactly,
-/// once, with the bound coming from generated code (the schema `count`, or the
-/// receiver cap) and never from a constant this library picked (§7.2 item 8,
-/// SofaBuffers ARCHITECTURE §9.5). `allocN` is that helper; `grow`/`setElem`
-/// keep the growth, which stays conformant for the id-keyed sequence-array
-/// shape alone.
-///
-/// It is left standing because removing it is the *codegen* side's move to
-/// sequence: generated code today emits its own `@min(n, 1024)` wrapper and
-/// then stores through `putGrowing`, so retiring either half here before
-/// `generator#386` switches the emission over would silently drop every element
-/// past the cap. Tracked in `corelib-zig#77`.
-///
-/// `putGrowing` extends the store as the elements really arrive, never past
-/// `n`. On allocation failure the array decodes as empty.
-pub fn allocCapped(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
-    return allocN(T, a, @min(n, ARRAY_INIT_CAP));
 }
 
 /// Place a wrapper-array string/blob element at its wire id (= array index),
@@ -275,6 +235,29 @@ test "setElem fills the gaps left by omitted default elements" {
     try std.testing.expectEqual(@as(u32, 9), s[3]);
 }
 
+test "the A shape allocates once: allocN, then no store ever grows" {
+    // What generated code does since generator#396: the count is bounded first,
+    // the destination is allocated at exactly it, and the stores fill it. A pool
+    // with room for that one allocation and nothing more proves the growth
+    // branch is never reached — a second allocation could not come out of it.
+    const n: usize = 64;
+    var pool: [n * @sizeOf(u32) + 32]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&pool);
+    const a = fba.allocator();
+
+    var s = allocN(u32, a, n);
+    try std.testing.expectEqual(n, s.len);
+    var i: usize = 0;
+    for (0..n) |k| putGrowing(&s, a, &i, n, @intCast(k));
+    try std.testing.expectEqual(n, i);
+    for (0..n) |k| try std.testing.expectEqual(@as(u32, @intCast(k)), s[k]);
+
+    // One element past the checked count: refused, and nothing grown into.
+    putGrowing(&s, a, &i, n, 999);
+    try std.testing.expectEqual(n, i);
+    try std.testing.expectEqual(n, s.len);
+}
+
 test "putGrowing never allocates past the announced count" {
     // An arena, per the allocator contract: growing abandons the previous block.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -309,39 +292,4 @@ test "allocN yields exactly n zeroed elements" {
     defer std.testing.allocator.free(@constCast(s));
     try std.testing.expectEqual(@as(usize, 3), s.len);
     for (s) |v| try std.testing.expectEqual(@as(u32, 0), v);
-}
-
-test "allocCapped hands a count under the cap through untouched" {
-    const s = allocCapped(u32, std.testing.allocator, 3);
-    defer std.testing.allocator.free(@constCast(s));
-    try std.testing.expectEqual(@as(usize, 3), s.len);
-    for (s) |v| try std.testing.expectEqual(@as(u32, 0), v);
-}
-
-test "allocCapped allocates nothing on the strength of an absurd count" {
-    // A header announcing 2^31 - 1 elements — 8 GiB of u32 — against a pool
-    // that holds only the cap. An eager allocation of the announced count
-    // cannot come out of this buffer at all, so the array would decode as
-    // empty; the capped one fits and the elements then arrive into it.
-    var pool: [ARRAY_INIT_CAP * @sizeOf(u32) + 64]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&pool);
-    const s = allocCapped(u32, fba.allocator(), 2_147_483_647);
-    try std.testing.expectEqual(ARRAY_INIT_CAP, s.len);
-    for (s) |v| try std.testing.expectEqual(@as(u32, 0), v);
-}
-
-test "the capped store still holds the elements that do arrive" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    // The announced count is a lie, so the eager allocation is the cap; the two
-    // elements that follow land in it without growing anything.
-    const n: usize = 2_147_483_647;
-    var s = allocCapped(u32, a, n);
-    var i: usize = 0;
-    putGrowing(&s, a, &i, n, 7);
-    putGrowing(&s, a, &i, n, 8);
-    try std.testing.expectEqual(@as(usize, 2), i);
-    try std.testing.expectEqual(ARRAY_INIT_CAP, s.len);
-    try std.testing.expectEqualSlices(u32, &.{ 7, 8 }, s[0..2]);
 }
