@@ -4,8 +4,11 @@
 //!
 //! * `decode` — the **fast contiguous path**. Hand it a complete message and it
 //!   advances a cursor over the buffer, decoding every field with no copies;
-//!   string/blob payloads are delivered as a single borrowed slice straight out
-//!   of your buffer. This is the 90 % case on a server and the speed showcase.
+//!   a string/blob payload is passed through the callback as a single slice out
+//!   of your own buffer. This is the 90 % case on a server and the speed
+//!   showcase. It is **not** a view: like every delivered value it is valid only
+//!   until the callback returns, exactly as on the streaming path — the one-shot
+//!   entry point buys no longer lifetime (CORELIB_PLAN §6.7.1).
 //! * `IStream` — the **streaming path** (ARCHITECTURE §5.2). Feed it bytes in
 //!   arbitrarily small chunks with `feed`; a single field header or payload may
 //!   be split across any number of `feed` calls and the decoder
@@ -698,8 +701,11 @@ inline fn emitFixlenValue(buf: []const u8, pos: usize, fp64: bool, id: Id, visit
 
 /// Decode a contiguous message in one shot — the fast zero-copy path.
 ///
-/// Every field is pushed to `visitor`; string/blob payloads are delivered as a
-/// single borrowed slice with no copy. Surfaces the three-valued outcome of
+/// Every field is pushed to `visitor`; a string/blob payload is passed through
+/// the callback as a single slice, with no copy. That slice is valid **only
+/// until the callback returns** — the same contract `feed` gives, because the
+/// one-shot path has no view exemption (CORELIB_PLAN §6.7.1); a visitor that
+/// keeps the value copies it. Surfaces the three-valued outcome of
 /// MESSAGE_SPEC §7, identically to the streaming path:
 ///
 /// * returns `.complete` (COMPLETE) — `buf` is a valid whole message ending at

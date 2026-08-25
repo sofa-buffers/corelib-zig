@@ -114,25 +114,18 @@ test "sofab.arrays is the closed set of helpers generated code calls (§6.1)" {
     // stopped emitting when it moved to placing an element at its wire id
     // (`setElem`/`grow`) instead of appending.
     //
-    // `allocCapped` is the one member whose call site is still a copy: the
-    // backend emits `_allocN`, its own `@min(n, 1024)` wrapper around `allocN`,
-    // and generator#345 switches that over to this name. Traceable either way —
-    // the rule it implements is the same one, in one place instead of one per
-    // generated module.
-    inline for (.{ "putGrowing", "putChecked", "grow", "allocN", "allocCapped", "setElem" }) |name| {
+    // `allocCapped` and `ARRAY_INIT_CAP` left with generator#396, which stopped
+    // emitting them: a native array's count is now bounded before it is
+    // allocated from, so the destination is `allocN(count)` and there is nothing
+    // to cap the first allocation at. A helper with no emitted call site is
+    // exactly what this closed set exists to keep out — and `ARRAY_INIT_CAP` was
+    // besides "a limit the codec invented of its own", which §6.2.1 forbids.
+    inline for (.{ "putGrowing", "putChecked", "grow", "allocN", "setElem" }) |name| {
         try std.testing.expect(@hasDecl(sofab.arrays, name));
     }
-    inline for (.{ "put", "trimTail", "last" }) |name| {
+    inline for (.{ "put", "trimTail", "last", "allocCapped", "ARRAY_INIT_CAP" }) |name| {
         try std.testing.expect(!@hasDecl(sofab.arrays, name));
     }
-}
-
-test "the eager-allocation cap is a declared constant, not a magic number" {
-    // A DoS policy two conformant decoders may disagree about while producing
-    // identical bytes: no shared vector can settle it, so it is versioned with
-    // the wire code that applies it rather than baked into every generated file.
-    try std.testing.expectEqual(usize, @TypeOf(sofab.arrays.ARRAY_INIT_CAP));
-    try std.testing.expect(sofab.arrays.ARRAY_INIT_CAP > 0);
 }
 
 test "the generated layer's support types are exported (ARCHITECTURE §8)" {

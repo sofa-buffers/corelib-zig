@@ -258,3 +258,132 @@ test "a latched INVALID survives mid-item and mid-payload state" {
     try std.testing.expectError(error.InvalidMessage, is2.feed(&.{ 0x00, 0x2A }, &rec2));
     try std.testing.expectEqual(@as(usize, 0), rec2.events.items.len);
 }
+
+// ---------------------------------------------------------------------------
+// item 5b — tolerance: non-canonical but well-formed input decodes
+// ---------------------------------------------------------------------------
+
+/// Decode `bytes` whole and byte-at-a-time, assert both reach `.complete` with
+/// exactly `want`, then re-encode `want` and assert the canonical bytes are
+/// `canonical` — item 5b's second half, "and re-encode canonically".
+fn expectTolerated(
+    arena: std.mem.Allocator,
+    bytes: []const u8,
+    want: []const common.Event,
+    canonical: []const u8,
+) !void {
+    var whole = common.Recorder.init(arena);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(bytes, &whole));
+    try common.expectEventsEqual(want, whole.events.items);
+
+    var piecewise = common.Recorder.init(arena);
+    var is = sofab.IStream.init();
+    var st = sofab.Status.incomplete;
+    for (bytes) |b| st = try is.feed(&.{b}, &piecewise);
+    try std.testing.expectEqual(sofab.Status.complete, st);
+    try common.expectEventsEqual(want, piecewise.events.items);
+
+    // The canonical spelling decodes to the same thing, and is what an encoder
+    // emits: a decoder that tolerates must not also *propagate* the padding.
+    var canon = common.Recorder.init(arena);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(canonical, &canon));
+    try common.expectEventsEqual(want, canon.events.items);
+    try std.testing.expect(bytes.len > canonical.len);
+}
+
+test "a non-minimal varint is tolerated at a header, a fixlen_word and a count (§7.2 item 5b)" {
+    // §4.1.2: minimality binds the *encoder*; a decoder must accept the padded
+    // spelling and decode it to the value it denotes. These are the three
+    // positions item 5b names, and nothing else in this file reaches them —
+    // being uniformly too strict is the one failure a majority vote cannot see.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Field header `80 00` — id 0, wire type 0 (unsigned) — then value 42.
+    try expectTolerated(
+        arena,
+        &.{ 0x80, 0x00, 0x2A },
+        &.{.{ .unsigned = .{ .id = 0, .value = 42 } }},
+        &.{ 0x00, 0x2A },
+    );
+
+    // `fixlen_word` `8A 00` = (1 << 3) | 2: a one-byte string, subtype and
+    // length both settled only by the second byte.
+    try expectTolerated(
+        arena,
+        &.{ 0x02, 0x8A, 0x00, 'a' },
+        &.{.{ .str = .{ .id = 0, .data = "a" } }},
+        &.{ 0x02, 0x0A, 'a' },
+    );
+
+    // Element count `81 00` = 1 on an unsigned array.
+    try expectTolerated(
+        arena,
+        &.{ 0x03, 0x81, 0x00, 0x2A },
+        &.{
+            .{ .array_begin = .{ .id = 0, .kind = .unsigned, .count = 1 } },
+            .{ .unsigned = .{ .id = 0, .value = 42 } },
+        },
+        &.{ 0x03, 0x01, 0x2A },
+    );
+}
+
+test "a sequence-end header with a non-zero id is an ordinary end (§4.9, §7.2 item 5b)" {
+    // The end marker's id carries no meaning, so any id within ID_MAX spells the
+    // same thing; only `0x07` is canonical. `87 00` is id 0 written
+    // non-minimally, `0F` is id 1 — both close the sequence `0E` opened.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const want: []const common.Event = &.{
+        .{ .sequence_begin = .{ .id = 1 } },
+        .{ .unsigned = .{ .id = 0, .value = 7 } },
+        .sequence_end,
+    };
+    try expectTolerated(arena, &.{ 0x0E, 0x00, 0x07, 0x87, 0x00 }, want, &.{ 0x0E, 0x00, 0x07, 0x07 });
+
+    // A plainly non-zero id, minimally spelled: same outcome, same length, so
+    // it is checked directly rather than through the shrinking helper.
+    var rec = common.Recorder.init(arena);
+    try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(&.{ 0x0E, 0x00, 0x07, 0x0F }, &rec));
+    try common.expectEventsEqual(want, rec.events.items);
+
+    // And what the encoder writes for that end is `0x07`.
+    var buf: [8]u8 = undefined;
+    var os = sofab.OStream.init(&buf);
+    try os.writeSequenceBeginLazy(1);
+    try os.writeUnsigned(0, 7);
+    try os.writeSequenceEnd();
+    try std.testing.expectEqualSlices(u8, &.{ 0x0E, 0x00, 0x07, 0x07 }, buf[0..os.bytesUsed()]);
+}
+
+// ---------------------------------------------------------------------------
+// item 6 — no partial evaluation of a half-arrived varint
+// ---------------------------------------------------------------------------
+
+test "a fixlen_word cut after a byte carrying a reserved subtype is Incomplete (§7.2 item 6)" {
+    // §4.1.1: a varint has no value before its final byte. The low three bits of
+    // a `fixlen_word`'s first byte already spell the subtype, so a decoder that
+    // evaluates it early answers INVALID here — where §4.1.1 requires
+    // INCOMPLETE. Nothing else in this file exercises that: the dangling `0x80`
+    // of the truncation test carries no settled sub-field to peek at, and the
+    // truncation walk above cuts a message whose `fixlen_word` is one byte long.
+    //
+    // Header `02` (id 0, fixlen), then a first `fixlen_word` byte with the
+    // continuation bit set and a reserved subtype in its low bits: 0x4 through
+    // 0x7, each in two spellings.
+    for ([_]u8{ 0x84, 0x85, 0x86, 0x87, 0x8C, 0x8D, 0x9E, 0xAF }) |first| {
+        errdefer std.debug.print("first fixlen_word byte 0x{X:0>2}\n", .{first});
+        try expectIncompleteWholeAndChunked(&.{ 0x02, first });
+    }
+
+    // Completing it settles the subtype for real, and only then is the reserved
+    // value a rejection: `84 00` = (0 << 3) | 4, subtype 4, reserved.
+    try expectInvalidWholeAndChunked(&.{ 0x02, 0x84, 0x00 });
+
+    // The same rule at a fixlen *array*'s word, which is read on its own path.
+    try expectIncompleteWholeAndChunked(&.{ 0x05, 0x01, 0x84 });
+    try expectInvalidWholeAndChunked(&.{ 0x05, 0x01, 0x84, 0x00 });
+}

@@ -65,7 +65,7 @@ suite. Nothing is pulled into downstream builds.
 |------|-----|
 | Streaming **out** | `OStream` writes into a caller buffer and calls a flush callback when it fills, so a message can exceed the buffer; `bufferSet` swaps the buffer mid-stream. |
 | Streaming **in** | `IStream.feed` takes arbitrarily small chunks and suspends/resumes at any byte boundary; string/blob payloads are delivered incrementally. |
-| Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only the few bytes of the one small item that straddles a chunk boundary — once that item is complete the rest of the chunk is parsed in place, at full contiguous speed. |
+| Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields to the visitor as callback-scoped slices; `feed` copies only the few bytes of the one small item that straddles a chunk boundary — once that item is complete the rest of the chunk is parsed in place, at full contiguous speed. |
 | No allocation | The codec is allocator-free — not just the hot path. Encoder state is a struct over your buffer (plus the inline sequence hold-back run, see below); the decoder's only memory is a fixed 64-byte carry buffer. Only the `sofab.arrays` helpers for dynamically sized arrays take an allocator, and only as a parameter. |
 | Raw speed | Unchecked pointer-advancing varint encode *and* decode once bounds are guaranteed, bulk `@memcpy`/native little-endian float loads, comptime-monomorphized visitor dispatch, **inline field writers** (a generated `serialize()` pays no call per field), `@branchHint(.cold)` on the drain path and on the chunk-boundary stitch, ReleaseFast shipping profile. |
 | Type safety | Wire types and value widths live in the type system; array element widths are comptime-checked, so an invalid element type is a compile error. |
@@ -466,8 +466,7 @@ arguments.
 | `sofab.FixedArray(T, N)` | a `count: N` array field: `N` elements of inline capacity plus the length actually carried |
 | `sofab.CollectingSink` | the flush sink behind a one-shot `encode()`, collecting the drained bytes into the caller's allocator |
 | `sofab.PayloadAcc` | one `string`/`blob` payload arriving in pieces, stitched and handed on as its own allocation |
-| `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `allocCapped` |
-| `sofab.arrays.ARRAY_INIT_CAP` | the ceiling on what an *announced* element count may claim up front: 1024 elements |
+| `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `at` |
 
 **`FixedArray` keeps its storage to itself**, so a length can never be left
 disagreeing with the elements beside it. A schema `count` is a **capacity** and
@@ -537,29 +536,39 @@ You own every buffer. The codec is allocation-free and holds no heap memory —
   reports `error.InvalidArgument` instead of storing into it.
   The struct itself is 1080 bytes on a 64-bit target: it reserves the full
   `MAX_DEPTH` lazy sequence hold-back run inline (see [Serialize](#serialize)).
-- **Decode (`decode` / `IStream` + visitor):** you own the input buffer and it
-  must outlive the `decode`/`feed` call. A `string`/`blob` chunk is a borrowed
-  slice; where it borrows from — and therefore how long it stays valid — depends
-  on the path. Scalars and floats always arrive by value.
-  - **`decode` (whole message in one buffer):** every delivered slice points
-    directly into the caller's input buffer, and is **valid for that buffer's
-    lifetime** — you may retain it as long as you keep the input buffer alive,
-    not merely for the duration of the callback.
-  - **`feed` (streaming, chunk by chunk):** a delivered slice is **valid only
-    during that callback** — copy it out to keep it. It usually points into the
-    chunk you just fed, but a payload that straddled a chunk boundary is
-    stitched together in `IStream`'s internal carry buffer and delivered as a
-    slice into *that*, which the next stitched item overwrites.
+- **Decode (`decode` / `IStream` + visitor):** you own the input bytes and they
+  must outlive the `decode`/`feed` call. Scalars and floats arrive by value; a
+  `string`/`blob` payload arrives through the callback, as a slice you copy where
+  you want it.
+  **Nothing the decoder delivers outlives the callback it was delivered in.** A
+  delivered slice is valid **only until that callback returns** — on the one-shot
+  `decode` path exactly as on the streaming `feed` path, since the two differ only
+  in how the bytes got here. Copy it out to keep it. No value is readable after
+  the call that delivered it: there is no payload position, no getter, and no
+  “valid until the next feed” slice.
+  Where a slice borrows from is not part of the contract and must not be relied
+  on: it usually points into the buffer or chunk you just fed, and the few bytes
+  of an item that straddled a chunk boundary come out of `IStream`'s fixed carry
+  buffer, which the next straddling item overwrites.
+  No wire value decides an allocation here — no count and no length sizes anything
+  the codec holds, on either path, and there is no library-owned accumulator for a
+  chunk-straddling field.
 
 | Buffer | Owner / lifetime |
 |--------|------------------|
 | **Output buffer** | Caller-owned `[]u8`; library never allocates or grows it (no sink → `error.BufferFull`). With a sink it must offer at least `MIN_OUTPUT_BUFFER` = 1 usable byte, checked at every installation; without one, no minimum applies. |
-| **Input buffer (`decode`)** | Caller-owned; must outlive the call. Delivered string/blob slices borrow from it and stay valid for its whole lifetime — retainable, not callback-scoped. |
-| **Input chunk (`feed`)** | Caller-owned; must outlive the call. Delivered string/blob slices are valid only during the callback; a carry-completed payload borrows from `IStream`, not from your chunk. |
+| **Input buffer (`decode`)** | Caller-owned; must outlive the call. Delivered string/blob slices are valid only for the duration of the callback — callback-scoped, never retainable. |
+| **Input chunk (`feed`)** | Caller-owned; must outlive the call. Delivered string/blob slices are valid only for the duration of the callback; a carry-completed payload borrows from `IStream`, not from your chunk. |
 
 Decoded values are pushed to a visitor, so nothing requires them to be
 address-stable. The only memory the decoder owns is `IStream`'s fixed 64-byte
-carry buffer — the few bytes of an item that straddled a chunk boundary.
+carry buffer — the few bytes of an item that straddled a chunk boundary; it is
+sized once, in the struct, and no message can make it larger.
+
+Beside the codec the package ships a **static helper layer** — `sofab.arrays` and
+`sofab.support` — which the codec itself never calls. Those helpers take an
+allocator as a parameter and allocate on the **generated** layer's behalf, which
+owns the storage each decoded field lands in. Their buffers are not the codec's.
 
 ## Build & test
 
@@ -567,15 +576,16 @@ carry buffer — the few bytes of an item that straddled a chunk boundary.
 zig build --release=fast         # static library in the shipping config (ReleaseFast)
 zig build test                   # unit + conformance tests (incl. shared vectors)
 zig build test --release=fast    # the same suite in the shipping config
-./coverage.sh                    # line coverage via kcov (HTML + percentage)
+./coverage.sh                    # line coverage via kcov (HTML + percentage; fails below 90%)
 ```
 
 CI runs `zig fmt --check`, the full suite in Debug and ReleaseFast, the same
 suite on a **big-endian** s390x host under QEMU and on a 32-bit x86 target in
 both modes, and the kcov coverage job. Conformance tests live in `tests/`
-(shared-vector replay, chunked encode/decode, roundtrip, malformed-input,
-cross-chunk UTF-8 and skip scenarios); unit tests live next to the code in
-`src/`.
+(shared-vector replay including the `sequence_growth` block, chunked
+encode/decode, chunk-lifetime scrubs, roundtrip, malformed-input, tolerance,
+cross-chunk UTF-8, array-growth geometry and skip scenarios); unit tests live
+next to the code in `src/`.
 
 ### Feature flags
 

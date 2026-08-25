@@ -133,8 +133,8 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test -Dtarget=x86-linux ${{ matrix.mode == 'release' && '--release=fast' || '' }}
 
-  # Line coverage via kcov over the test binaries; publishes the README's
-  # coverage badge from main.
+  # Line coverage via kcov over the test binaries; gated at the §7.3 bar by
+  # coverage.sh, and publishes the README's coverage badge from main.
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -204,6 +204,10 @@ jobs:
           sudo make -C /tmp/kcov-43/build install
           kcov --version
 
+      # `coverage.sh` owns the bar: it exits non-zero below COVERAGE_MIN
+      # (default 90, CORELIB_PLAN §7.3), so this job fails on a regression
+      # instead of publishing a red badge and staying green. The percentage is
+      # re-read here only to render the badge.
       - name: Measure coverage
         run: |
           ./coverage.sh

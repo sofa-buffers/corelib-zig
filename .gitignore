@@ -13,3 +13,7 @@ zig-out/
 # Editor / OS cruft
 *.swp
 .DS_Store
+# Core dumps — a deliberately crashing test (or a debugger session) drops one
+# here, and it is tens of megabytes.
+/core
+/core.*

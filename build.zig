@@ -53,6 +53,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     tests_mod.addImport("sofab", sofab);
+    // Whether the test binary will run on the machine that builds it. The
+    // §6.6.4 heap high-water measurement (tests/no_allocation_tests.zig) reads
+    // the *process's* peak RSS, which under an emulator is the emulator's — its
+    // JIT caches grow as translation warms up, and none of that is the codec's.
+    // Only build.zig can tell the two apart, so it says so and the test skips
+    // itself elsewhere; every other check in that file is target-independent.
+    const host = b.graph.host.result;
+    const native_target = target.result.cpu.arch == host.cpu.arch and
+        target.result.os.tag == host.os.tag;
+    const test_options = b.addOptions();
+    test_options.addOption(bool, "native_target", native_target);
+    tests_mod.addOptions("test_options", test_options);
     // Embed the shared cross-language vectors verbatim from assets/.
     tests_mod.addAnonymousImport("test_vectors", .{
         .root_source_file = b.path("assets/test_vectors.json"),
