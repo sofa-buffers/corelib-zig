@@ -577,7 +577,7 @@ owns the storage each decoded field lands in. Their buffers are not the codec's.
 zig build --release=fast         # static library in the shipping config (ReleaseFast)
 zig build test                   # unit + conformance tests (incl. shared vectors)
 zig build test --release=fast    # the same suite in the shipping config
-./coverage.sh                    # line coverage via kcov (HTML + percentage)
+./coverage.sh                    # line coverage via kcov (HTML + percentage; fails below 90%)
 ```
 
 CI runs `zig fmt --check`, the full suite in Debug and ReleaseFast, the same
