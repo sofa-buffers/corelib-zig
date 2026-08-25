@@ -6,6 +6,7 @@ test {
     _ = @import("roundtrip_tests.zig");
     _ = @import("malformed_tests.zig");
     _ = @import("utf8_chunk_tests.zig");
+    _ = @import("chunk_lifetime_tests.zig");
     _ = @import("fixlen_array_kind_tests.zig");
     _ = @import("sequence_skip_tests.zig");
     _ = @import("api_tests.zig");
