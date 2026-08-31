@@ -19,8 +19,13 @@
 //! `corelib-rs`'), so what makes the rejection **terminal** is the visitor
 //! latching it: once a cap is exceeded, nothing further lands, which is exactly
 //! what `growth_no_partial_extension` asserts by bounding the container's
-//! length. §6.2.1 puts the decision there — "the codec never invents a limit of
-//! its own and never clamps to one".
+//! length.
+//!
+//! The cap's **value** is the collector's, supplied per call — the corelib has
+//! none to offer and defaults none. The **comparison** is `sofab.arrays`'
+//! (`growCapped`), which §6.2.1 permits: "a corelib MAY take a limit as an
+//! argument and perform the check itself". One implementation either way, so
+//! the collector does not also guard in front of the call.
 //!
 //! Cases are keyed by a delivery sequence rather than by bytes, because two
 //! ports that grow differently emit identical bytes. Indices are cap-relative:
@@ -66,24 +71,22 @@ fn Collector(comptime kind: Kind) type {
         elem: usize = 0,
         in_elem: bool = false,
 
-        /// The cap check §6.2.1 puts at the element index, *before* the
-        /// container it indexes into is extended.
-        fn admit(self: *Self, id: sofab.Id) bool {
-            if (self.limit_exceeded) return false;
-            if (id >= cap) {
-                self.limit_exceeded = true;
-                return false;
-            }
-            return true;
-        }
-
         pub fn string(self: *Self, id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void {
             _ = .{ total, offset };
             if (kind != .string or self.depth != 1) return;
-            if (!self.admit(id)) return;
+            if (self.limit_exceeded) return;
+            // The slot is reserved first, so the cap is decided at the element
+            // index before *anything* is sized — the payload copy below is this
+            // harness's own storage (generated decode stores a view instead) and
+            // is made only once the index has been admitted.
+            const grown = sofab.arrays.growCapped([]const u8, self.alloc, &self.out, id + 1, default, cap) catch {
+                self.limit_exceeded = true;
+                return;
+            };
+            if (!grown) return;
             const copy = self.alloc.alloc(u8, chunk.len) catch return;
             @memcpy(copy, chunk);
-            sofab.arrays.setElem([]const u8, self.alloc, &self.out, id, default, copy);
+            sofab.arrays.at(self.out, id).* = copy;
         }
 
         pub fn unsigned(self: *Self, id: sofab.Id, value: u64) void {
@@ -95,8 +98,12 @@ fn Collector(comptime kind: Kind) type {
         pub fn sequenceBegin(self: *Self, id: sofab.Id) void {
             self.depth += 1;
             if (self.depth == 2 and kind == .structural) {
-                if (!self.admit(id)) return;
-                if (!sofab.arrays.grow(Element, self.alloc, &self.out, id + 1, default)) return;
+                if (self.limit_exceeded) return;
+                const grown = sofab.arrays.growCapped(Element, self.alloc, &self.out, id + 1, default, cap) catch {
+                    self.limit_exceeded = true;
+                    return;
+                };
+                if (!grown) return;
                 self.elem = id;
                 self.in_elem = true;
             }

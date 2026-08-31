@@ -79,9 +79,22 @@ pub const Error = error{
     /// A limit violation is always a hard decode error (never clamp, never
     /// truncate), raised **before** any allocation for the offending field.
     ///
-    /// This corelib neither enforces these limits nor defines any default
-    /// values: the caps come from the sofabgen config and the enforcement lives
-    /// in generated decode code, which raises this category uniformly. See
+    /// This corelib **holds no limit and defines no default value**: every cap
+    /// is a number the caller supplies for one call and this library does not
+    /// retain (CORELIB_PLAN §6.2.1). Where it is raised is split by field kind,
+    /// and each rule has exactly one implementation:
+    ///
+    /// * an **array** cap — `max_dyn_array_count` — is passed to
+    ///   `arrays.allocNCapped` / `arrays.growCapped` / `arrays.setElemCapped`,
+    ///   which compare and raise it, §6.2.1 permitting a corelib to "take a
+    ///   limit as an argument and perform the check itself";
+    /// * a **string** or **blob** cap — `max_dyn_string_len`,
+    ///   `max_dyn_blob_len` — is raised by generated decode code, whose payload
+    ///   callback assigns the destination directly and calls nothing here that
+    ///   could carry the number.
+    ///
+    /// A format ceiling (`ARRAY_MAX`, `FIXLEN_MAX`, §6.2) is **not** a receiver
+    /// cap and is never reported as one: exceeding it is `InvalidMessage`. See
     /// sofa-buffers/generator#102; mirrors corelib-go's `ErrLimitExceeded`.
     LimitExceeded,
 };

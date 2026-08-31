@@ -129,10 +129,11 @@ test "an id gap is filled with the element default and shifts nothing (§7.2 ite
 }
 
 test "a rejected id leaves the container unextended, and a lower id still lands" {
-    // The cap belongs to generated code (§6.2.1: "the codec never invents a
-    // limit of its own"), so the rejection is the caller's `if (id >= cap)`.
-    // What the helper owes is that nothing was extended on the way to it — the
-    // check is *before* the call, and the call is the only thing that grows.
+    // The cap's *value* belongs to generated code (§6.2.1: "the codec never
+    // invents a limit of its own"), but the comparison is `setElemCapped`'s —
+    // §6.2.1 permits a corelib to take the number as an argument and check it.
+    // What the helper owes is that nothing was extended on the way to the
+    // refusal: no allocator call, no length change.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var counter: CountingAllocator = .{ .child = arena.allocator() };
@@ -140,19 +141,20 @@ test "a rejected id leaves the container unextended, and a lower id still lands"
 
     const cap: usize = 8;
     var s: []const u32 = &.{};
-    arrays.setElem(u32, a, &s, cap - 1, 0, 7); // the last legal id decodes
+    try arrays.setElemCapped(u32, a, &s, cap - 1, 0, 7, cap); // the last legal id
     try std.testing.expectEqual(cap, s.len);
 
     const before_len = s.len;
     const before_calls = counter.calls;
-    const over: usize = cap;
-    const outcome: sofab.Error!void = if (over >= cap) sofab.Error.LimitExceeded else {};
-    try std.testing.expectError(sofab.Error.LimitExceeded, outcome);
+    try std.testing.expectError(
+        sofab.Error.LimitExceeded,
+        arrays.setElemCapped(u32, a, &s, cap, 0, 9, cap),
+    );
     try std.testing.expectEqual(before_len, s.len);
     try std.testing.expectEqual(before_calls, counter.calls);
 
     // …and the container is still usable for a lower id.
-    arrays.setElem(u32, a, &s, 2, 0, 42);
+    try arrays.setElemCapped(u32, a, &s, 2, 0, 42, cap);
     try std.testing.expectEqual(cap, s.len);
     try std.testing.expectEqual(@as(u32, 42), s[2]);
     try std.testing.expectEqual(@as(u32, 7), s[cap - 1]);

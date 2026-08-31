@@ -120,7 +120,17 @@ test "sofab.arrays is the closed set of helpers generated code calls (§6.1)" {
     // to cap the first allocation at. A helper with no emitted call site is
     // exactly what this closed set exists to keep out — and `ARRAY_INIT_CAP` was
     // besides "a limit the codec invented of its own", which §6.2.1 forbids.
-    inline for (.{ "putGrowing", "putChecked", "grow", "allocN", "setElem" }) |name| {
+    //
+    // `allocNCapped`, `growCapped` and `setElemCapped` are the receiver-capped
+    // forms of the three calls that size a destination (§6.2.1): the cap is an
+    // argument the generated call site passes for that one comparison, so they
+    // are the same closed set counted once more, not a limit this library
+    // holds. They are unrelated to the withdrawn `allocCapped`, which capped
+    // the first *reservation* of a growing array rather than refusing a count.
+    inline for (.{
+        "putGrowing", "putChecked",   "grow",       "allocN",
+        "setElem",    "allocNCapped", "growCapped", "setElemCapped",
+    }) |name| {
         try std.testing.expect(@hasDecl(sofab.arrays, name));
     }
     inline for (.{ "put", "trimTail", "last", "allocCapped", "ARRAY_INIT_CAP" }) |name| {
