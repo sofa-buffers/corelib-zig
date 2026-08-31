@@ -73,10 +73,16 @@ pub const STRICT_UTF8 = @import("utf8.zig").STRICT_UTF8;
 
 /// Array helpers the generated **decode** path needs for array fields (bounded
 /// element stores, growth of a decode-owned destination, wrapper-array element
-/// placement). They carry no schema knowledge — the count, the element default
-/// and the allocator are passed in. Encoding an array needs no helper: it is
-/// written linearly and gap-free, trailing default elements included
-/// (MESSAGE_SPEC §3).
+/// placement). They carry no schema knowledge — the count, the element default,
+/// the allocator and, where the schema bounds nothing, the receiver cap are all
+/// passed in. Encoding an array needs no helper: it is written linearly and
+/// gap-free, trailing default elements included (MESSAGE_SPEC §3).
+///
+/// The three that size a destination come in two forms: `allocN` / `grow` /
+/// `setElem` for a field the schema bounds, and `allocNCapped` / `growCapped` /
+/// `setElemCapped` for one it does not, which take the caller's
+/// `max_dyn_array_count` and answer `error.LimitExceeded` at the count or index
+/// header (CORELIB_PLAN §6.2.1). No limit is held, defaulted or retained here.
 pub const arrays = @import("arrays.zig");
 
 /// Storage for a `count: N` native array field: `N` elements of inline capacity
@@ -89,9 +95,14 @@ pub const FixedArray = @import("support.zig").FixedArray;
 /// allocates no output buffer of its own — CORELIB_PLAN §5.1 assigns that to
 /// the generated layer, and this is the mechanism it drives, not a policy.
 pub const CollectingSink = @import("support.zig").CollectingSink;
-/// Accumulator a generated decoder holds for a `string`/`blob` payload split
-/// across feed chunks: it stitches the pieces and hands the completed payload
-/// back as its own allocation.
+/// Payload materialization a generated decoder holds for its `string`/`blob`
+/// fields: `take` hands back one contiguous payload however it arrived —
+/// borrowed whole on the contiguous path, copied whole on the streaming one,
+/// stitched from the pieces when a feed boundary split it — and `takeCapped`
+/// is the same for a field the schema leaves unbounded, comparing the caller's
+/// `max_dyn_string_len` / `max_dyn_blob_len` against the announced length
+/// before any of that happens (CORELIB_PLAN §6.2.1). No limit is held,
+/// defaulted or retained here.
 pub const PayloadAcc = @import("support.zig").PayloadAcc;
 
 test {

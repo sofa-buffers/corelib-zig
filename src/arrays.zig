@@ -12,6 +12,38 @@
 //! a compact scalar array is written linearly and gap-free, `M` being its
 //! length, so `[1, 2, 0, 0]` and `[1, 2]` are different values that encode
 //! differently (MESSAGE_SPEC §3).
+//!
+//! ## Receiver caps (CORELIB_PLAN §6.2.1)
+//!
+//! A schema-**unbounded** array — one whose schema declares no `count:` — would
+//! otherwise let the sender choose the receiver's allocation, so a receiver cap
+//! bounds it. Three helpers here take that cap and perform the comparison:
+//! `allocNCapped`, `growCapped` and `setElemCapped`, each the capped form of
+//! the call the generated decode path already makes at that point. §6.2.1
+//! permits exactly this — "a corelib MAY take a limit as an argument and
+//! perform the check itself" — and the rule then has ONE implementation: a
+//! caller that passes the cap here does not also guard in front of the call.
+//!
+//! **The number stays the caller's.** Nothing here holds a limit, defaults one,
+//! keeps one past the call it was given for, or clamps to one. The cap is a
+//! parameter; a breach is `error.LimitExceeded` (§6.3), a policy rejection of
+//! well-formed bytes, never a shortened array. A format ceiling (§6.2
+//! `ARRAY_MAX`) is not a receiver cap and is never reported as one — that
+//! ceiling is the decoder's, and its violation is `error.InvalidMessage`.
+//!
+//! **The uncapped forms are for schema-bounded fields only.** There the schema
+//! bound governs and its violation is `INVALID` (MESSAGE_SPEC §7.1), decided by
+//! generated code before it calls; §6.2.1 forbids a receiver cap on such a
+//! field, so those call sites have no cap to pass and no `error.LimitExceeded`
+//! to handle. That is why the cap is a second entry point rather than an
+//! optional argument: an argument spelled "no cap here" reads as *unlimited*,
+//! which §6.2.1 forbids as well, and it would leave every schema-bounded call
+//! site handling an error that cannot occur there.
+//!
+//! **A skipped field is never capped**, and nothing here can skip one: every
+//! call site sits behind the MESSAGE_SPEC §7.3 tag test, in the arm that
+//! decodes the field, so a field whose wire type contradicts the declared one
+//! is stepped over without reaching a helper at all.
 
 const std = @import("std");
 
@@ -100,6 +132,11 @@ inline fn capacityFor(len: usize) usize {
 /// belongs to the count-prefixed shape, which is allocated at its checked count
 /// once and never grown; the two shapes never mix (SofaBuffers ARCHITECTURE
 /// §9.5).
+///
+/// **This is the schema-bounded entry point**, as `allocN` is: `n` here is a
+/// length the caller has already bounded against the schema `count`. A wrapper
+/// array the schema leaves unbounded goes through `growCapped`, which takes the
+/// receiver cap and decides it before anything is sized (CORELIB_PLAN §6.2.1).
 pub fn grow(comptime T: type, a: std.mem.Allocator, s: *[]const T, n: usize, fill: T) bool {
     const len = s.*.len;
     if (len >= n) return true;
@@ -118,21 +155,81 @@ pub fn grow(comptime T: type, a: std.mem.Allocator, s: *[]const T, n: usize, fil
     return true;
 }
 
+/// `grow` for a **schema-unbounded** wrapper array, bounded by the receiver cap
+/// `cap` the caller supplies (CORELIB_PLAN §6.2.1).
+///
+/// A wrapper array announces no count, so there is no count header to check:
+/// its length is the highest present element id + 1 (MESSAGE_SPEC §5.1), which
+/// is the `n` the caller passes. Bounding `n` by `cap` is therefore exactly the
+/// element-**index** cap §6.2.1 requires — the amplification vector here is one
+/// element at a huge id, not a count word, and two elements at id 0 and id
+/// 16383 are a 16384-slot container.
+///
+/// The comparison runs **before** the destination is sized, so an over-cap
+/// index neither allocates a block nor extends the slice over capacity the
+/// previous call left spare. As in `allocNCapped`, an allocation failure keeps
+/// its own channel — `false`, not an error — so out of memory and a refused
+/// index stay distinguishable.
+pub fn growCapped(
+    comptime T: type,
+    a: std.mem.Allocator,
+    s: *[]const T,
+    n: usize,
+    fill: T,
+    cap: usize,
+) error{LimitExceeded}!bool {
+    if (n > cap) return error.LimitExceeded;
+    return grow(T, a, s, n, fill);
+}
+
 /// Allocate a zeroed native-array destination of exactly `n` elements.
 ///
 /// The **A-shape** allocation (SofaBuffers ARCHITECTURE §9.5): everything whose
 /// count or length is on the wire ahead of its payload checks that word and
 /// allocates exactly it, once. `n` is therefore a count the caller has *already*
-/// bounded — against the schema `count` (`INVALID` above it, MESSAGE_SPEC §7.1)
-/// or against the receiver cap on a schema-unbounded field (`LimitExceeded`,
-/// CORELIB_PLAN §6.2.1) — because only generated code knows either number. This
-/// helper commits the memory; it does not decide the bound.
+/// bounded against the schema `count` — a wire count above it is `INVALID`
+/// (MESSAGE_SPEC §7.1) and only generated code knows that number. This helper
+/// commits the memory; it does not decide that bound.
+///
+/// **This is the schema-bounded entry point.** A field the schema leaves
+/// unbounded is bounded by the receiver instead, and goes through
+/// `allocNCapped`, which takes that cap and decides it here (CORELIB_PLAN
+/// §6.2.1). The two are never both in play: §6.2.1 forbids a receiver cap on a
+/// field the schema already bounds.
 ///
 /// On allocation failure the array decodes as empty.
 pub fn allocN(comptime T: type, a: std.mem.Allocator, n: usize) []const T {
     const s = a.alloc(T, n) catch return &.{};
     @memset(s, std.mem.zeroes(T));
     return s;
+}
+
+/// `allocN` for a **schema-unbounded** array, bounded by the receiver cap `cap`
+/// the caller supplies (CORELIB_PLAN §6.2.1).
+///
+/// `n` is the array's wire count, read from its header and otherwise bounded
+/// only by the format ceiling — a ~10-byte message can claim `2^31` elements.
+/// A count above `cap` is `error.LimitExceeded`: a **policy** rejection of
+/// well-formed bytes, distinct from `InvalidMessage` (§6.3), never a clamp. It
+/// is decided **before** the allocation it exists to prevent, which is the
+/// point of the check sitting here rather than after the call.
+///
+/// **Out of memory is a different outcome and keeps its own channel.** As in
+/// `allocN`, a failed allocation yields the empty slice, so the caller can
+/// always tell "the receiver refused this count" (an error) from "the allocator
+/// had no room" (an empty array) — the one distinction a cap on an allocating
+/// helper must not lose.
+///
+/// `cap` is used for this one comparison and not retained: the value is the
+/// caller's, per §6.2.1, and this helper neither defaults it nor remembers it.
+pub fn allocNCapped(
+    comptime T: type,
+    a: std.mem.Allocator,
+    n: usize,
+    cap: usize,
+) error{LimitExceeded}![]const T {
+    if (n > cap) return error.LimitExceeded;
+    return allocN(T, a, n);
 }
 
 /// Mutable pointer to element `i` of a decode destination.
@@ -166,9 +263,37 @@ pub fn at(s: anytype, i: usize) *std.meta.Elem(@TypeOf(s)) {
 /// Growth is `grow`'s: the destination ends up exactly `id + 1` long, while the
 /// block behind it doubles, so filling an array element by element costs O(n)
 /// copies rather than O(n²). `grow`'s precondition is this function's too.
+///
+/// **This is the schema-bounded entry point**: `id` is an index the caller has
+/// already bounded against the schema `count` (an element past it is `INVALID`,
+/// MESSAGE_SPEC §7.1). An unbounded wrapper array goes through `setElemCapped`.
 pub fn setElem(comptime T: type, a: std.mem.Allocator, s: *[]const T, id: usize, fill: T, v: T) void {
     if (!grow(T, a, s, id + 1, fill)) return;
     @constCast(&s.*[id]).* = v;
+}
+
+/// `setElem` for a **schema-unbounded** wrapper array, bounded by the receiver
+/// cap `cap` on the element **index** (CORELIB_PLAN §6.2.1) — `growCapped`'s
+/// bound, applied at the placement that does the growing.
+///
+/// `id >= cap` is `error.LimitExceeded`, tested before the destination is sized
+/// and before `id + 1` is ever formed.
+///
+/// **`cap` is the array-count cap, and only that.** An element's own payload
+/// length — a `string`'s or `blob`'s `max_dyn_*_len` — is not this call's
+/// business: the payload arrives through the visitor's own callback and is
+/// bounded there, before it is handed to `v`.
+pub fn setElemCapped(
+    comptime T: type,
+    a: std.mem.Allocator,
+    s: *[]const T,
+    id: usize,
+    fill: T,
+    v: T,
+    cap: usize,
+) error{LimitExceeded}!void {
+    if (id >= cap) return error.LimitExceeded;
+    setElem(T, a, s, id, fill, v);
 }
 
 // ---------------------------------------------------------------------------
@@ -292,4 +417,133 @@ test "allocN yields exactly n zeroed elements" {
     defer std.testing.allocator.free(@constCast(s));
     try std.testing.expectEqual(@as(usize, 3), s.len);
     for (s) |v| try std.testing.expectEqual(@as(u32, 0), v);
+}
+
+// --- receiver caps (CORELIB_PLAN §6.2.1) -----------------------------------
+
+test "allocNCapped refuses a count above the cap, before allocating anything" {
+    // A pool with no room at all: reaching the allocator is observable as an
+    // empty result, so an over-cap count that errors instead proves the check
+    // ran ahead of the allocation it exists to prevent.
+    var pool: [0]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&pool);
+    const a = fba.allocator();
+    try std.testing.expectError(error.LimitExceeded, allocNCapped(u32, a, 65, 64));
+}
+
+test "allocNCapped: the cap is a maximum, not an exclusive bound" {
+    const a = std.testing.allocator;
+    const at_cap = try allocNCapped(u32, a, 64, 64);
+    defer a.free(@constCast(at_cap));
+    try std.testing.expectEqual(@as(usize, 64), at_cap.len);
+    try std.testing.expectError(error.LimitExceeded, allocNCapped(u32, a, 65, 64));
+}
+
+test "a refused count is an error, never a shortened array" {
+    // §6.2.1 "Rejected, never clamped": the caller must not be handed `cap`
+    // elements where the wire said more.
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.LimitExceeded, allocNCapped(u32, a, 1_000_000, 8));
+}
+
+test "out of memory and an over-cap count stay distinguishable" {
+    // The one distinction a cap on an allocating helper must not lose: OOM
+    // keeps `allocN`'s empty-slice channel, the cap breach is the error.
+    var pool: [0]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&pool);
+    const a = fba.allocator();
+    const oom = try allocNCapped(u32, a, 4, 64); // within the cap, no memory
+    try std.testing.expectEqual(@as(usize, 0), oom.len);
+    try std.testing.expectError(error.LimitExceeded, allocNCapped(u32, a, 65, 64));
+}
+
+test "the cap is the caller's, per call: nothing is retained between them" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.LimitExceeded, allocNCapped(u32, a, 8, 4));
+    const wider = try allocNCapped(u32, a, 8, 16); // the earlier 4 binds nothing
+    defer a.free(@constCast(wider));
+    try std.testing.expectEqual(@as(usize, 8), wider.len);
+}
+
+test "growCapped bounds the element index and grows nothing above it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var s: []const u32 = &.{};
+    // A wrapper array's length is its highest present id + 1, so a cap of 8
+    // admits ids 0..7 and refuses id 8.
+    try std.testing.expect(try growCapped(u32, a, &s, 8, 0, 8));
+    try std.testing.expectEqual(@as(usize, 8), s.len);
+    try std.testing.expectError(error.LimitExceeded, growCapped(u32, a, &s, 9, 0, 8));
+    // Refused before the destination was sized: the length is what it was.
+    try std.testing.expectEqual(@as(usize, 8), s.len);
+}
+
+test "growCapped refuses before it claims spare capacity" {
+    // The block behind a length of 5 holds 8 (see `capacityFor`), so growing to
+    // 6 would be a pure memset with no allocator call at all. The cap must
+    // still refuse it, or a destination could pass its cap for free.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var s: []const u32 = &.{};
+    try std.testing.expect(try growCapped(u32, a, &s, 5, 0, 5));
+    try std.testing.expectError(error.LimitExceeded, growCapped(u32, a, &s, 6, 0, 5));
+    try std.testing.expectEqual(@as(usize, 5), s.len);
+}
+
+test "setElemCapped places up to the cap and refuses the index past it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var s: []const []const u8 = &.{};
+    try setElemCapped([]const u8, a, &s, 3, "", "d", 4);
+    try std.testing.expectEqual(@as(usize, 4), s.len);
+    try std.testing.expectEqualStrings("d", s[3]);
+    try std.testing.expectEqualStrings("", s[0]); // the gap keeps the fill
+
+    try std.testing.expectError(error.LimitExceeded, setElemCapped([]const u8, a, &s, 4, "", "e", 4));
+    try std.testing.expectEqual(@as(usize, 4), s.len);
+}
+
+test "setElemCapped refuses a huge index without forming id + 1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var s: []const u32 = &.{};
+    try std.testing.expectError(
+        error.LimitExceeded,
+        setElemCapped(u32, arena.allocator(), &s, std.math.maxInt(usize), 0, 7, 65536),
+    );
+    try std.testing.expectEqual(@as(usize, 0), s.len);
+}
+
+test "a matrix row takes the index cap first, then the row's own count" {
+    // ARCHITECTURE §9.5: id first, then count -- the order the generated
+    // `sequenceBegin` arm calls them in.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var rows: []const []const u32 = &.{};
+    try std.testing.expect(try growCapped([]const u32, a, &rows, 2, &.{}, 4));
+    at(rows, 1).* = try allocNCapped(u32, a, 3, 4);
+    try std.testing.expectEqual(@as(usize, 3), rows[1].len);
+
+    // The row index is refused before the row's count is ever looked at.
+    try std.testing.expectError(error.LimitExceeded, growCapped([]const u32, a, &rows, 5, &.{}, 4));
+    // And a row whose own count clears the index cap is refused on the count.
+    try std.testing.expectError(error.LimitExceeded, allocNCapped(u32, a, 5, 4));
+}
+
+test "the uncapped forms carry no limit of their own" {
+    // §6.2.1: the codec holds no limit and defaults none. The schema-bounded
+    // entry points take no cap at all, so a count generated code has cleared
+    // against the schema is allocated whatever a receiver cap elsewhere says.
+    const a = std.testing.allocator;
+    const s = allocN(u32, a, 100_000);
+    defer a.free(@constCast(s));
+    try std.testing.expectEqual(@as(usize, 100_000), s.len);
 }
