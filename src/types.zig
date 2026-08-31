@@ -89,9 +89,11 @@ pub const Error = error{
     ///   which compare and raise it, §6.2.1 permitting a corelib to "take a
     ///   limit as an argument and perform the check itself";
     /// * a **string** or **blob** cap — `max_dyn_string_len`,
-    ///   `max_dyn_blob_len` — is raised by generated decode code, whose payload
-    ///   callback assigns the destination directly and calls nothing here that
-    ///   could carry the number.
+    ///   `max_dyn_blob_len` — is passed to `PayloadAcc.takeCapped`, which
+    ///   compares it against the payload's announced length and raises it there,
+    ///   before the payload is borrowed, copied or stitched. A caller comparing
+    ///   after its own materializing call would already have committed the
+    ///   memory the cap exists to deny.
     ///
     /// A format ceiling (`ARRAY_MAX`, `FIXLEN_MAX`, §6.2) is **not** a receiver
     /// cap and is never reported as one: exceeding it is `InvalidMessage`. See

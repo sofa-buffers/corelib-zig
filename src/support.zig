@@ -193,6 +193,31 @@ pub const CollectingSink = struct {
 /// newest one, and a growing buffer would rebase them onto the old block: a
 /// stale length past the live bytes, and a freed read under an allocator that
 /// releases.
+///
+/// ## Receiver caps (CORELIB_PLAN §6.2.1)
+///
+/// `take` is the whole payload-materialization decision — borrow, copy or
+/// stitch — and `takeCapped` is its capped form, for a `string`/`blob` field
+/// the schema leaves unbounded (`max_dyn_string_len` / `max_dyn_blob_len`).
+/// The cap is compared against the **announced `total`**, at the length header
+/// and **before a single byte is taken**: an over-cap payload is refused
+/// without a copy, without an append and without the accumulator's scratch
+/// being sized. That placement is the whole point of the check living here —
+/// §6.2.1 requires a limit to be enforced "at the count/length header, before
+/// the allocation it is meant to prevent", and a caller comparing *after* its
+/// materializing call has already committed the memory the cap exists to deny.
+///
+/// **The number stays the caller's.** Nothing here holds a limit, defaults
+/// one, keeps one past the call it was given for, or clamps to one; a refusal
+/// is `error.LimitExceeded` (§6.3), a policy rejection of well-formed bytes.
+/// `FIXLEN_MAX` (§6.2) is the format's ceiling, not a receiver cap, and the
+/// decoder reports it as `error.InvalidMessage`.
+///
+/// **A skipped field is never capped, and never reassembled.** Neither entry
+/// point can skip a field, so both belong *inside* the arm that decodes one:
+/// a payload the visitor declines — an unknown id, or a wire type that
+/// contradicts the declared one (MESSAGE_SPEC §7.3) — is walked, and calling
+/// `take` for it would buffer a payload nothing was ever going to read.
 pub const PayloadAcc = struct {
     /// The pieces of the payload being assembled. Not API: the completed
     /// payload leaves through `push`, as its own allocation.
@@ -209,6 +234,11 @@ pub const PayloadAcc = struct {
     /// Both allocations come from `a`. The scratch is reused for every payload
     /// and released by `deinit`; an arena — what generated code passes here —
     /// frees it together with the message it belongs to.
+    ///
+    /// This is the **stitch** alone: a caller that has already decided a
+    /// whole-payload chunk can be borrowed rather than copied calls this only
+    /// for the pieces. `take` below is that decision plus this, and
+    /// `takeCapped` is the form that carries a receiver cap.
     pub fn push(
         self: *PayloadAcc,
         a: std.mem.Allocator,
@@ -220,6 +250,75 @@ pub const PayloadAcc = struct {
         try self._buf.appendSlice(a, chunk);
         if (self._buf.items.len < total) return null;
         return try a.dupe(u8, self._buf.items[0..total]);
+    }
+
+    /// One contiguous payload out of however many chunks it arrived in — the
+    /// whole of what a generated `string`/`blob` callback does before it looks
+    /// at the value. Returns `null` while the payload is still incomplete.
+    ///
+    /// Three cases, and `borrow` picks between the first two:
+    ///
+    /// * the payload arrived **whole** and the caller **may borrow** it — the
+    ///   contiguous `decode` path, whose buffer is the caller's own and outlives
+    ///   the message: the chunk is handed straight back, nothing is allocated;
+    /// * the payload arrived **whole** but the caller **must not borrow** — the
+    ///   streaming path, where a payload completing inside the decoder's fixed,
+    ///   *reused* carry buffer would be overwritten by the next stitched item:
+    ///   it is copied, once;
+    /// * the payload arrived **split**, and `push` stitches it.
+    ///
+    /// **This is the schema-bounded entry point**, as `arrays.allocN` is: a
+    /// `maxlen` bound is the caller's to decide, and its violation is `INVALID`
+    /// (MESSAGE_SPEC §7.1), not a cap. A field the schema leaves unbounded goes
+    /// through `takeCapped`.
+    pub fn take(
+        self: *PayloadAcc,
+        a: std.mem.Allocator,
+        total: usize,
+        offset: usize,
+        chunk: []const u8,
+        borrow: bool,
+    ) std.mem.Allocator.Error!?[]const u8 {
+        if (offset == 0 and chunk.len >= total) {
+            if (borrow) return chunk[0..total];
+            return try a.dupe(u8, chunk[0..total]);
+        }
+        return self.push(a, total, offset, chunk);
+    }
+
+    /// `take` for a **schema-unbounded** `string`/`blob` field, bounded by the
+    /// receiver cap `cap` the caller supplies (CORELIB_PLAN §6.2.1).
+    ///
+    /// `total` is the payload's announced byte length, read from the field's
+    /// length header and otherwise bounded only by the format ceiling
+    /// `FIXLEN_MAX` — a handful of header bytes can claim two gigabytes. A
+    /// `total` above `cap` is `error.LimitExceeded`: a **policy** rejection of
+    /// well-formed bytes, distinct from `InvalidMessage` (§6.3), never a
+    /// truncation to `cap` bytes.
+    ///
+    /// The comparison runs **before** anything is taken — ahead of the copy in
+    /// `take`, ahead of `push`'s append into the scratch, and on every chunk of
+    /// the payload rather than only the first, so a split payload is refused at
+    /// its first delivery and stays refused. Nothing is buffered for a payload
+    /// this rejects.
+    ///
+    /// **The two failures stay apart.** `error.LimitExceeded` is the receiver
+    /// refusing a length; `error.OutOfMemory` is the allocator having no room
+    /// for one it accepted. A caller maps the first to its `LimitExceeded`
+    /// outcome and the second to a failed decode, and never confuses them.
+    ///
+    /// `cap` is used for this one comparison and not retained.
+    pub fn takeCapped(
+        self: *PayloadAcc,
+        a: std.mem.Allocator,
+        total: usize,
+        offset: usize,
+        chunk: []const u8,
+        borrow: bool,
+        cap: usize,
+    ) error{ LimitExceeded, OutOfMemory }!?[]const u8 {
+        if (total > cap) return error.LimitExceeded;
+        return try self.take(a, total, offset, chunk, borrow);
     }
 
     /// Release the scratch buffer. Payloads already handed out are unaffected:
@@ -376,6 +475,119 @@ test "a new payload does not inherit the previous one's bytes" {
     const next = (try acc.push(a, 2, 0, "hi")).?;
     defer a.free(@constCast(next));
     try std.testing.expectEqualStrings("hi", next);
+}
+
+test "take borrows a whole payload and copies one it may not borrow" {
+    var acc: PayloadAcc = .{};
+    defer acc.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+    const whole = "one contiguous payload";
+
+    // The contiguous decode() path: the caller's own buffer outlives the
+    // message, so the payload is handed straight back, unallocated.
+    var fa: std.testing.FailingAllocator = .init(a, .{ .fail_index = 0 });
+    const borrowed = (try acc.take(fa.allocator(), whole.len, 0, whole, true)).?;
+    try std.testing.expectEqual(whole.ptr, borrowed.ptr);
+    try std.testing.expectEqual(@as(usize, 0), fa.allocations);
+
+    // The streaming path: the same whole chunk may point into the decoder's
+    // reused carry buffer, so it is copied even though it never split.
+    const copied = (try acc.take(a, whole.len, 0, whole, false)).?;
+    defer a.free(@constCast(copied));
+    try std.testing.expect(copied.ptr != whole.ptr);
+    try std.testing.expectEqualStrings(whole, copied);
+}
+
+test "take stitches a split payload, whichever way borrow is set" {
+    var acc: PayloadAcc = .{};
+    defer acc.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+
+    // Nothing can be borrowed once a payload arrives in pieces: the value does
+    // not exist in any one chunk.
+    try std.testing.expect(try acc.take(a, 6, 0, "abc", true) == null);
+    const p = (try acc.take(a, 6, 3, "def", true)).?;
+    defer a.free(@constCast(p));
+    try std.testing.expectEqualStrings("abcdef", p);
+    try std.testing.expect(p.ptr != acc._buf.items.ptr);
+}
+
+test "takeCapped refuses an over-cap payload at the length header, allocating nothing" {
+    // The measurement, not just the outcome (CORELIB_PLAN §6.2.1, §6.6): a
+    // caller that compares AFTER its materializing call has already committed
+    // the memory the cap exists to deny -- a megabyte announced, a megabyte
+    // taken, then LimitExceeded.
+    var acc: PayloadAcc = .{};
+    defer acc.deinit(std.testing.allocator);
+    var fa: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const a = fa.allocator();
+
+    const mib: usize = 1 << 20;
+    var chunk: [4096]u8 = @splat('x');
+
+    // Whole-payload delivery (streaming, must copy) and the first piece of a
+    // split one: both are refused before a byte is taken.
+    try std.testing.expectError(error.LimitExceeded, acc.takeCapped(a, 8, 0, "abcdefgh", false, 4));
+    try std.testing.expectError(error.LimitExceeded, acc.takeCapped(a, mib, 0, &chunk, false, 1024));
+    // ... and so is a borrowable one: the cap is a policy bound on the
+    // announced length, not a property of who owns the bytes.
+    try std.testing.expectError(error.LimitExceeded, acc.takeCapped(a, 8, 0, "abcdefgh", true, 4));
+    // A later piece of the same payload stays refused, not accepted mid-flight.
+    try std.testing.expectError(error.LimitExceeded, acc.takeCapped(a, mib, 4096, &chunk, false, 1024));
+
+    try std.testing.expectEqual(@as(usize, 0), fa.allocations);
+    try std.testing.expectEqual(@as(usize, 0), fa.allocated_bytes);
+    // Not a byte was buffered, so the scratch was never sized either.
+    try std.testing.expectEqual(@as(usize, 0), acc._buf.capacity);
+}
+
+test "a payload at the cap is taken whole; the refusal is a rejection, not a trim" {
+    var acc: PayloadAcc = .{};
+    defer acc.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+
+    // total == cap is inside the bound.
+    const at_cap = (try acc.takeCapped(a, 8, 0, "abcdefgh", false, 8)).?;
+    defer a.free(@constCast(at_cap));
+    try std.testing.expectEqualStrings("abcdefgh", at_cap);
+
+    // One byte over is refused outright -- never handed back as `cap` bytes of
+    // the payload, which is data corruption wearing a safety jacket (§6.2.1).
+    try std.testing.expectError(
+        error.LimitExceeded,
+        acc.takeCapped(a, 9, 0, "abcdefghi", false, 8),
+    );
+}
+
+test "a cap breach and an allocation failure stay distinguishable" {
+    var acc: PayloadAcc = .{};
+    defer acc.deinit(std.testing.allocator);
+    var fa: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    const a = fa.allocator();
+
+    // Under the cap: the allocator is what fails, and it says so.
+    try std.testing.expectError(error.OutOfMemory, acc.takeCapped(a, 4, 0, "abcd", false, 64));
+    // Over it: the receiver refused the length, and no allocator was consulted.
+    try std.testing.expectError(error.LimitExceeded, acc.takeCapped(a, 128, 0, "abcd", false, 64));
+}
+
+test "no cap survives the call it was given for" {
+    // §6.2.1: the number is the caller's, used for one comparison and not
+    // retained. A tight cap on one payload does not bind the next, and the
+    // uncapped entry point is unaffected by either.
+    var acc: PayloadAcc = .{};
+    defer acc.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+
+    try std.testing.expectError(error.LimitExceeded, acc.takeCapped(a, 8, 0, "abcdefgh", false, 2));
+
+    const next = (try acc.takeCapped(a, 8, 0, "abcdefgh", false, 64)).?;
+    defer a.free(@constCast(next));
+    try std.testing.expectEqualStrings("abcdefgh", next);
+
+    const unbounded = (try acc.take(a, 8, 0, "abcdefgh", false)).?;
+    defer a.free(@constCast(unbounded));
+    try std.testing.expectEqualStrings("abcdefgh", unbounded);
 }
 
 test "PayloadAcc reports an allocation failure rather than swallowing it" {

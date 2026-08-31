@@ -95,9 +95,14 @@ pub const FixedArray = @import("support.zig").FixedArray;
 /// allocates no output buffer of its own — CORELIB_PLAN §5.1 assigns that to
 /// the generated layer, and this is the mechanism it drives, not a policy.
 pub const CollectingSink = @import("support.zig").CollectingSink;
-/// Accumulator a generated decoder holds for a `string`/`blob` payload split
-/// across feed chunks: it stitches the pieces and hands the completed payload
-/// back as its own allocation.
+/// Payload materialization a generated decoder holds for its `string`/`blob`
+/// fields: `take` hands back one contiguous payload however it arrived —
+/// borrowed whole on the contiguous path, copied whole on the streaming one,
+/// stitched from the pieces when a feed boundary split it — and `takeCapped`
+/// is the same for a field the schema leaves unbounded, comparing the caller's
+/// `max_dyn_string_len` / `max_dyn_blob_len` against the announced length
+/// before any of that happens (CORELIB_PLAN §6.2.1). No limit is held,
+/// defaulted or retained here.
 pub const PayloadAcc = @import("support.zig").PayloadAcc;
 
 test {

@@ -237,15 +237,16 @@ The error set also carries `error.LimitExceeded`, for a **receiver-configured**
 decode limit on an unbounded field (`max_dyn_array_count`, `max_dyn_string_len`,
 `max_dyn_blob_len`). This library holds no limit and defines no default value:
 the caps come from the sofabgen config, and each is a number the caller supplies
-for one call. Where the comparison runs is split by field kind. The **array**
-cap is passed to `sofab.arrays.allocNCapped`, `growCapped` and `setElemCapped`,
-which raise it at the count or index header before allocating. The **string**
-and **blob** caps are raised by generated decode code, which assigns those
-payloads to their destination directly and calls nothing here that could carry
-the number. Neither cap is raised twice: whichever side checks, the other does
-not. `error.LimitExceeded` is distinct from `error.InvalidMessage` — a receiver
-limit is policy, not wire malformation — and the format ceilings `ARRAY_MAX` and
-`FIXLEN_MAX` are not receiver caps: exceeding one is `error.InvalidMessage` (see
+for one call. Every comparison runs **here**, at the header that announces the
+size and before anything is sized from it. The **array** cap goes to
+`sofab.arrays.allocNCapped`, `growCapped` and `setElemCapped`, at the count or
+element index; the **string** and **blob** caps go to
+`sofab.PayloadAcc.takeCapped`, at the payload's announced length, ahead of the
+copy or the stitch that would otherwise commit it. No cap is raised twice:
+whichever side checks, the other does not. `error.LimitExceeded` is distinct
+from `error.InvalidMessage` — a receiver limit is policy, not wire
+malformation — and the format ceilings `ARRAY_MAX` and `FIXLEN_MAX` are not
+receiver caps: exceeding one is `error.InvalidMessage` (see
 [`generator#102`](https://github.com/sofa-buffers/generator/issues/102)).
 
 ### UTF-8 validation (`SOFAB_STRICT_UTF8`)
@@ -472,7 +473,7 @@ arguments.
 |---|---|
 | `sofab.FixedArray(T, N)` | a `count: N` array field: `N` elements of inline capacity plus the length actually carried |
 | `sofab.CollectingSink` | the flush sink behind a one-shot `encode()`, collecting the drained bytes into the caller's allocator |
-| `sofab.PayloadAcc` | one `string`/`blob` payload arriving in pieces, stitched and handed on as its own allocation |
+| `sofab.PayloadAcc` | one `string`/`blob` payload however it arrived — borrowed whole, copied whole, or stitched out of pieces — via `take` and the receiver-capped `takeCapped` |
 | `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `at`, and the receiver-capped `allocNCapped` / `growCapped` / `setElemCapped` |
 
 **`FixedArray` keeps its storage to itself**, so a length can never be left
@@ -492,6 +493,19 @@ index header before the destination is sized. A cap is never both passed and
 guarded, and never both applied and defaulted: the uncapped forms carry no
 limit, and an allocation failure keeps its own channel (an empty slice, or
 `false`) so it stays distinguishable from a refused count.
+
+**`PayloadAcc` has the same two entry points.** `take` materializes one payload
+whichever way it arrived: handed straight back when it came whole and the
+caller's buffer may be borrowed (the contiguous `decode` path), copied when it
+came whole but the caller must not borrow (the streaming path, where a payload
+completing inside the decoder's reused carry buffer would be overwritten by the
+next stitched item), stitched when it came in pieces. It is the entry point for
+a field the schema bounds with `maxlen`, whose violation is `INVALID` and the
+caller's to decide. `takeCapped` is for a field the schema leaves unbounded: it
+compares `max_dyn_string_len` / `max_dyn_blob_len` against the **announced
+length**, before a byte is borrowed, copied or appended, so an over-cap payload
+costs nothing at all. Comparing afterwards would report the same refusal having
+already committed the memory it exists to deny.
 
 **`CollectingSink`** is a sink the caller constructs with its own allocator and
 installs like any other flush target; the corelib still allocates nothing. It is
