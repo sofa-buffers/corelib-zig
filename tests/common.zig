@@ -111,48 +111,322 @@ pub const Recorder = struct {
     }
 };
 
-/// A `Recorder` that declares **no** `sequenceBegin`/`sequenceEnd` — a receiver
-/// that knows only flat fields and therefore cannot descend into a nested
-/// scope. Everything inside a sequence must be auto-skipped by the decoder
-/// (CORELIB_PLAN §5.2/§6), so this visitor may only ever record the *top-level*
-/// fields of a message.
-pub const FlatRecorder = struct {
-    rec: Recorder,
+/// A callback kind a visitor can decline to declare — the *only* way a
+/// receiver in this port refuses a field, since a duck-typed visitor has no
+/// per-id decline API. `array` names `arrayBegin` (the header hook; the
+/// elements still arrive through the scalar callbacks), `sequence` names the
+/// `sequenceBegin`/`sequenceEnd` pair.
+pub const Callback = enum { unsigned, signed, fp32, fp64, string, blob, array, sequence };
 
-    pub fn init(arena: std.mem.Allocator) FlatRecorder {
-        return .{ .rec = Recorder.init(arena) };
-    }
+/// A recording visitor that declares every callback **except** the one named by
+/// `omit`.
+///
+/// This is what makes the decoder do the skipping. `IStream` dispatches through
+/// `@hasDecl`, so a missing callback means the decoder still parses the field's
+/// bytes — its length word, its element count, its whole sub-sequence — and
+/// then discards them instead of delivering them (CORELIB_PLAN §5.2). Every
+/// field that follows is therefore read from an offset the skip computed, which
+/// is exactly the property the shared suite's `skip_ids` vectors are built to
+/// check.
+///
+/// The distinction against `SkipRecorder` matters: that one receives everything
+/// and drops what it does not want, so it exercises decoding, not skipping.
+/// This one never receives the field at all.
+///
+/// Each arm is written out rather than generated: a Zig struct cannot declare a
+/// method conditionally, and the *absence* of the declaration is the whole
+/// signal, so every omission has to be its own type.
+pub fn Declining(comptime omit: Callback) type {
+    return switch (omit) {
+        .unsigned => struct {
+            rec: Recorder,
 
-    pub fn events(self: *const FlatRecorder) []const Event {
-        return self.rec.events.items;
-    }
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn signed(self: *@This(), id: Id, value: i64) void {
+                self.rec.signed(id, value);
+            }
+            pub fn fp32(self: *@This(), id: Id, value: f32) void {
+                self.rec.fp32(id, value);
+            }
+            pub fn fp64(self: *@This(), id: Id, value: f64) void {
+                self.rec.fp64(id, value);
+            }
+            pub fn string(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.string(id, total, offset, chunk);
+            }
+            pub fn blob(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.blob(id, total, offset, chunk);
+            }
+            pub fn arrayBegin(self: *@This(), id: Id, kind: sofab.ArrayKind, count: usize) void {
+                self.rec.arrayBegin(id, kind, count);
+            }
+            pub fn sequenceBegin(self: *@This(), id: Id) void {
+                self.rec.sequenceBegin(id);
+            }
+            pub fn sequenceEnd(self: *@This()) void {
+                self.rec.sequenceEnd();
+            }
+        },
+        .signed => struct {
+            rec: Recorder,
 
-    pub fn unsigned(self: *FlatRecorder, id: Id, value: u64) void {
-        self.rec.unsigned(id, value);
-    }
-    pub fn signed(self: *FlatRecorder, id: Id, value: i64) void {
-        self.rec.signed(id, value);
-    }
-    pub fn fp32(self: *FlatRecorder, id: Id, value: f32) void {
-        self.rec.fp32(id, value);
-    }
-    pub fn fp64(self: *FlatRecorder, id: Id, value: f64) void {
-        self.rec.fp64(id, value);
-    }
-    pub fn string(self: *FlatRecorder, id: Id, total: usize, offset: usize, chunk: []const u8) void {
-        self.rec.string(id, total, offset, chunk);
-    }
-    pub fn blob(self: *FlatRecorder, id: Id, total: usize, offset: usize, chunk: []const u8) void {
-        self.rec.blob(id, total, offset, chunk);
-    }
-    pub fn arrayBegin(self: *FlatRecorder, id: Id, kind: sofab.ArrayKind, count: usize) void {
-        self.rec.arrayBegin(id, kind, count);
-    }
-};
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn unsigned(self: *@This(), id: Id, value: u64) void {
+                self.rec.unsigned(id, value);
+            }
+            pub fn fp32(self: *@This(), id: Id, value: f32) void {
+                self.rec.fp32(id, value);
+            }
+            pub fn fp64(self: *@This(), id: Id, value: f64) void {
+                self.rec.fp64(id, value);
+            }
+            pub fn string(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.string(id, total, offset, chunk);
+            }
+            pub fn blob(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.blob(id, total, offset, chunk);
+            }
+            pub fn arrayBegin(self: *@This(), id: Id, kind: sofab.ArrayKind, count: usize) void {
+                self.rec.arrayBegin(id, kind, count);
+            }
+            pub fn sequenceBegin(self: *@This(), id: Id) void {
+                self.rec.sequenceBegin(id);
+            }
+            pub fn sequenceEnd(self: *@This()) void {
+                self.rec.sequenceEnd();
+            }
+        },
+        .fp32 => struct {
+            rec: Recorder,
+
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn unsigned(self: *@This(), id: Id, value: u64) void {
+                self.rec.unsigned(id, value);
+            }
+            pub fn signed(self: *@This(), id: Id, value: i64) void {
+                self.rec.signed(id, value);
+            }
+            pub fn fp64(self: *@This(), id: Id, value: f64) void {
+                self.rec.fp64(id, value);
+            }
+            pub fn string(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.string(id, total, offset, chunk);
+            }
+            pub fn blob(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.blob(id, total, offset, chunk);
+            }
+            pub fn arrayBegin(self: *@This(), id: Id, kind: sofab.ArrayKind, count: usize) void {
+                self.rec.arrayBegin(id, kind, count);
+            }
+            pub fn sequenceBegin(self: *@This(), id: Id) void {
+                self.rec.sequenceBegin(id);
+            }
+            pub fn sequenceEnd(self: *@This()) void {
+                self.rec.sequenceEnd();
+            }
+        },
+        .fp64 => struct {
+            rec: Recorder,
+
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn unsigned(self: *@This(), id: Id, value: u64) void {
+                self.rec.unsigned(id, value);
+            }
+            pub fn signed(self: *@This(), id: Id, value: i64) void {
+                self.rec.signed(id, value);
+            }
+            pub fn fp32(self: *@This(), id: Id, value: f32) void {
+                self.rec.fp32(id, value);
+            }
+            pub fn string(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.string(id, total, offset, chunk);
+            }
+            pub fn blob(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.blob(id, total, offset, chunk);
+            }
+            pub fn arrayBegin(self: *@This(), id: Id, kind: sofab.ArrayKind, count: usize) void {
+                self.rec.arrayBegin(id, kind, count);
+            }
+            pub fn sequenceBegin(self: *@This(), id: Id) void {
+                self.rec.sequenceBegin(id);
+            }
+            pub fn sequenceEnd(self: *@This()) void {
+                self.rec.sequenceEnd();
+            }
+        },
+        .string => struct {
+            rec: Recorder,
+
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn unsigned(self: *@This(), id: Id, value: u64) void {
+                self.rec.unsigned(id, value);
+            }
+            pub fn signed(self: *@This(), id: Id, value: i64) void {
+                self.rec.signed(id, value);
+            }
+            pub fn fp32(self: *@This(), id: Id, value: f32) void {
+                self.rec.fp32(id, value);
+            }
+            pub fn fp64(self: *@This(), id: Id, value: f64) void {
+                self.rec.fp64(id, value);
+            }
+            pub fn blob(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.blob(id, total, offset, chunk);
+            }
+            pub fn arrayBegin(self: *@This(), id: Id, kind: sofab.ArrayKind, count: usize) void {
+                self.rec.arrayBegin(id, kind, count);
+            }
+            pub fn sequenceBegin(self: *@This(), id: Id) void {
+                self.rec.sequenceBegin(id);
+            }
+            pub fn sequenceEnd(self: *@This()) void {
+                self.rec.sequenceEnd();
+            }
+        },
+        .blob => struct {
+            rec: Recorder,
+
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn unsigned(self: *@This(), id: Id, value: u64) void {
+                self.rec.unsigned(id, value);
+            }
+            pub fn signed(self: *@This(), id: Id, value: i64) void {
+                self.rec.signed(id, value);
+            }
+            pub fn fp32(self: *@This(), id: Id, value: f32) void {
+                self.rec.fp32(id, value);
+            }
+            pub fn fp64(self: *@This(), id: Id, value: f64) void {
+                self.rec.fp64(id, value);
+            }
+            pub fn string(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.string(id, total, offset, chunk);
+            }
+            pub fn arrayBegin(self: *@This(), id: Id, kind: sofab.ArrayKind, count: usize) void {
+                self.rec.arrayBegin(id, kind, count);
+            }
+            pub fn sequenceBegin(self: *@This(), id: Id) void {
+                self.rec.sequenceBegin(id);
+            }
+            pub fn sequenceEnd(self: *@This()) void {
+                self.rec.sequenceEnd();
+            }
+        },
+        .array => struct {
+            rec: Recorder,
+
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn unsigned(self: *@This(), id: Id, value: u64) void {
+                self.rec.unsigned(id, value);
+            }
+            pub fn signed(self: *@This(), id: Id, value: i64) void {
+                self.rec.signed(id, value);
+            }
+            pub fn fp32(self: *@This(), id: Id, value: f32) void {
+                self.rec.fp32(id, value);
+            }
+            pub fn fp64(self: *@This(), id: Id, value: f64) void {
+                self.rec.fp64(id, value);
+            }
+            pub fn string(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.string(id, total, offset, chunk);
+            }
+            pub fn blob(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.blob(id, total, offset, chunk);
+            }
+            pub fn sequenceBegin(self: *@This(), id: Id) void {
+                self.rec.sequenceBegin(id);
+            }
+            pub fn sequenceEnd(self: *@This()) void {
+                self.rec.sequenceEnd();
+            }
+        },
+        .sequence => struct {
+            rec: Recorder,
+
+            pub fn init(arena: std.mem.Allocator) @This() {
+                return .{ .rec = Recorder.init(arena) };
+            }
+            pub fn events(self: *const @This()) []const Event {
+                return self.rec.events.items;
+            }
+            pub fn unsigned(self: *@This(), id: Id, value: u64) void {
+                self.rec.unsigned(id, value);
+            }
+            pub fn signed(self: *@This(), id: Id, value: i64) void {
+                self.rec.signed(id, value);
+            }
+            pub fn fp32(self: *@This(), id: Id, value: f32) void {
+                self.rec.fp32(id, value);
+            }
+            pub fn fp64(self: *@This(), id: Id, value: f64) void {
+                self.rec.fp64(id, value);
+            }
+            pub fn string(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.string(id, total, offset, chunk);
+            }
+            pub fn blob(self: *@This(), id: Id, total: usize, offset: usize, chunk: []const u8) void {
+                self.rec.blob(id, total, offset, chunk);
+            }
+            pub fn arrayBegin(self: *@This(), id: Id, kind: sofab.ArrayKind, count: usize) void {
+                self.rec.arrayBegin(id, kind, count);
+            }
+        },
+    };
+}
+
+/// A receiver that knows only flat fields and therefore cannot descend into a
+/// nested scope: everything inside a sequence must be auto-skipped by the
+/// decoder (CORELIB_PLAN §5.2/§6), so this visitor may only ever record the
+/// *top-level* fields of a message.
+pub const FlatRecorder = Declining(.sequence);
 
 /// A visitor modelling a receiver that ignores a set of field `skip_ids`.
 /// Scalars/arrays with a skipped id are dropped; a skipped `sequenceBegin`
 /// drops the whole nested sequence by tracking depth until the matching end.
+///
+/// **This is an event filter, not a skip.** It declares every callback, so the
+/// decoder hands it every field and it discards the ones whose id it was told
+/// to ignore — which proves those fields *decode*, not that anything was
+/// skipped. It is here because the shared vectors state their skip set as ids
+/// and this is the only way a visitor can express an id set at all. The
+/// decoder's own skip path is driven by `Declining` instead, and the shared
+/// vector suite runs both over every `skip_ids` vector.
 pub const SkipRecorder = struct {
     rec: Recorder,
     skip: []const Id,
@@ -228,6 +502,10 @@ pub fn Collector(comptime capacity: usize) type {
 
         pub fn push(ctx: ?*anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            // Loud on overflow, in every optimize mode: a release build would
+            // otherwise scribble past the array and the comparison downstream
+            // would report a byte mismatch instead of "the sink is too small".
+            if (self.len + chunk.len > capacity) @panic("Collector capacity exceeded — raise it, never drop bytes");
             @memcpy(self.data[self.len..][0..chunk.len], chunk);
             self.len += chunk.len;
         }

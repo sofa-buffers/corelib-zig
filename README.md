@@ -616,8 +616,12 @@ suite on a **big-endian** s390x host under QEMU and on a 32-bit x86 target in
 both modes, and the kcov coverage job. Conformance tests live in `tests/`
 (shared-vector replay including the `sequence_growth` block, chunked
 encode/decode, chunk-lifetime scrubs, roundtrip, malformed-input, tolerance,
-cross-chunk UTF-8, array-growth geometry and skip scenarios); unit tests live
-next to the code in `src/`.
+cross-chunk UTF-8, array-growth geometry and skip scenarios — every vector
+carrying `skip_ids`, decoded whole and one byte at a time, both through a
+receiver that filters those ids out and through receivers that leave their
+callback undeclared so the decoder skips the field itself); unit tests live
+next to the code in `src/`. The vector suite prints how many vectors and how
+many checks each scenario ran.
 
 ### Feature flags
 

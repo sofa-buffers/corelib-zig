@@ -104,7 +104,24 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit + conformance tests (incl. shared vectors)");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(conformance_tests).step);
+    // The conformance binary runs with **inherited** stdio rather than through
+    // the build runner's test protocol. The shared-vector suite has to state
+    // what it covered — how many vectors and how many checks each scenario ran
+    // — and a CI log is where that has to land. Under the test protocol every
+    // byte the binary writes to stderr is collected as the step's *output*,
+    // which the build runner then renders exactly like a failure: the step is
+    // marked `w` and a red `failed command: …` line is printed under it, on a
+    // run that exited 0. Inheriting the streams puts the counts straight on the
+    // terminal and leaves a genuine failure unambiguous: the standalone test
+    // runner marks the test `FAIL`, prints its trace and a
+    // `N passed; M failed.` summary, and exits non-zero — which fails this step
+    // like any other run. The cost is that off a TTY (CI) the runner names each
+    // test as it goes instead of drawing a progress bar; that is the log this
+    // trade buys, and it is the log that says which test failed.
+    const run_conformance = std.Build.Step.Run.create(b, "run conformance-tests");
+    run_conformance.addArtifactArg(conformance_tests);
+    run_conformance.stdio = .inherit;
+    test_step.dependOn(&run_conformance.step);
 
     // Install the test binaries without running them, so coverage.sh can
     // execute them under kcov.
