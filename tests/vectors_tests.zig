@@ -15,13 +15,39 @@
 //! 5. **skip** — for vectors carrying `skip_ids`, a receiver that ignores those
 //!    ids (skipping a `sequence_begin` skips its whole sub-tree) must still
 //!    recover every other field, whole and chunked.
+//! 6. **decoder-side skip** — the same vectors again, once per callback kind
+//!    their skipped fields use, through a visitor that leaves exactly that
+//!    callback undeclared. Scenario 5 filters events a receiver was handed;
+//!    this one makes the *decoder* walk the skipped field's bytes and discard
+//!    them, which is what `skip_ids` describes and the only way this port's
+//!    duck-typed visitor can decline anything (`@hasDecl`, and the absence of
+//!    `sequenceBegin` for a whole sub-sequence). Whole and chunked, so a skip
+//!    is exercised across chunk boundaries too.
 //!
 //! Roundtrip (encode → decode) falls out of running (1) and (3) on every
 //! vector.
 //!
-//! This build has every wire type and the 64-bit value width compiled in, so
-//! all shared vectors are representable and run (`requires` tags matter only to
-//! feature-reduced builds and are ignored here, per the vector README).
+//! **Capability gating.** A vector's optional `requires` list names the library
+//! features it needs. This build has every wire type and the 64-bit value width
+//! compiled in — there is no `SOFAB_DISABLE_*` equivalent here — so every tag
+//! resolves to "supported" and no vector is gated out, which is exactly what
+//! the vector README prescribes for a port that cannot compile features out.
+//! The tags are still *resolved* rather than ignored (`Capability`): an
+//! unrecognised one stops the suite instead of quietly running a vector this
+//! build may not represent, and a port that later grows a feature switch flips
+//! one arm and gets the matrix graded per configuration.
+//!
+//! **Nothing is silently narrowed.** Every number the loader takes out of the
+//! JSON — vector ids, values, array elements, skip ids, offsets — is
+//! range-checked before it is stored (`narrowU`/`narrowI`, `fieldId`),
+//! and every fixed-capacity buffer the suite encodes into is checked against
+//! the vector that is about to use it (`buffer_bytes`). A vector that outgrows
+//! this harness therefore fails loudly rather than testing less than it claims
+//! — the failure mode the shared C runner's fixed `MAXSKIP` had, where an
+//! over-long `skip_ids` list was truncated and the extra ids got *read*.
+//!
+//! **The run says what it covered.** Each scenario prints the number of vectors
+//! it ran, the number gated out, and the number of checks it made.
 
 const std = @import("std");
 const sofab = @import("sofab");
@@ -58,7 +84,15 @@ fn get(v: std.json.Value, key: []const u8) ?std.json.Value {
 /// from std.json as `.number_string`.
 fn asU64(v: std.json.Value) u64 {
     return switch (v) {
-        .integer => |i| @intCast(i),
+        // Negative here would wrap to a huge unsigned in a release build — the
+        // same silent misread `narrowU` exists to prevent, one layer earlier.
+        .integer => |i| blk: {
+            if (i < 0) {
+                std.debug.print("vector value {d} is negative where an unsigned is expected\n", .{i});
+                @panic("test_vectors.json holds a value this loader would misread");
+            }
+            break :blk @intCast(i);
+        },
         .number_string => |s| std.fmt.parseInt(u64, s, 10) catch @panic("bad u64 in vectors"),
         else => @panic("expected unsigned number"),
     };
@@ -88,10 +122,118 @@ fn asF64(v: std.json.Value) f64 {
     };
 }
 
+/// A vector's `u64` narrowed to `T`, **refusing** rather than truncating.
+///
+/// `@intCast` would be a safety panic in Debug and silent corruption in
+/// ReleaseFast; the shared vectors now carry ids up to 100001 and 130-element
+/// arrays, so the loader states the bound it is enforcing instead of assuming
+/// one.
+fn narrowU(comptime T: type, v: u64) T {
+    if (v > std.math.maxInt(T)) {
+        std.debug.print("vector value {d} does not fit {s}\n", .{ v, @typeName(T) });
+        @panic("test_vectors.json holds a value this loader would truncate");
+    }
+    return @intCast(v);
+}
+
+/// The signed counterpart of `narrowU`.
+fn narrowI(comptime T: type, v: i64) T {
+    if (v < std.math.minInt(T) or v > std.math.maxInt(T)) {
+        std.debug.print("vector value {d} does not fit {s}\n", .{ v, @typeName(T) });
+        @panic("test_vectors.json holds a value this loader would truncate");
+    }
+    return @intCast(v);
+}
+
 fn fieldId(f: std.json.Value) Id {
     const v = get(f, "id") orelse return 0;
-    return @intCast(asU64(v));
+    return narrowU(Id, asU64(v));
 }
+
+// --- capability gating (`requires`) -------------------------------------------
+
+/// The optional library features a vector can ask for. The tag set is the
+/// shared vector README's table; `dynamic_arrays` is deliberately absent, as it
+/// tags the `sequence_growth` block only (that block is run by
+/// `sequence_growth_tests.zig`, which owns its gating).
+const Capability = enum {
+    /// fp32/fp64/string/blob, or a fixed-length array.
+    fixlen,
+    /// any array field.
+    array,
+    /// a nested sequence.
+    sequence,
+    /// a 64-bit float (implies `fixlen`).
+    fp64,
+    /// a value, element or id outside the 32-bit range.
+    int64,
+
+    /// Resolve a tag from the asset, refusing an unknown one: silently ignoring
+    /// it would run a vector against a build that may not represent it.
+    fn parse(tag: []const u8) Capability {
+        return std.meta.stringToEnum(Capability, tag) orelse {
+            std.debug.print("unknown `requires` capability tag: {s}\n", .{tag});
+            @panic("teach this suite the capability tag rather than ignoring it");
+        };
+    }
+
+    /// Whether *this* build can represent the capability. Every arm is `true`:
+    /// this port compiles the whole wire format in unconditionally. The switch
+    /// is exhaustive on purpose — a build option that removes a feature flips
+    /// its arm, and the skip matrix then grades itself per configuration
+    /// instead of being dropped whole.
+    fn supported(self: Capability) bool {
+        return switch (self) {
+            .fixlen, .array, .sequence, .fp64, .int64 => true,
+        };
+    }
+};
+
+/// True when a vector asks for something this build cannot represent, so it is
+/// reported as gated out rather than run (or silently dropped).
+fn gatedOut(vec: std.json.Value) bool {
+    const reqs = get(vec, "requires") orelse return false;
+    for (reqs.array.items) |r| {
+        if (!Capability.parse(r.string).supported()) return true;
+    }
+    return false;
+}
+
+// --- run accounting -----------------------------------------------------------
+
+/// Capacity of every fixed buffer this suite encodes into. Checked against each
+/// vector before it is used, so a longer vector fails loudly here rather than
+/// overrunning a collector in a release build.
+const buffer_bytes: usize = 8192;
+
+fn assertFits(name: []const u8, len: usize) void {
+    if (len > buffer_bytes) {
+        std.debug.print("vector [{s}] is {d} bytes, buffers hold {d}\n", .{ name, len, buffer_bytes });
+        @panic("raise `buffer_bytes` — never run a vector through a buffer too small for it");
+    }
+}
+
+/// What a scenario covered, printed at the end of its test so a CI log states
+/// how much of the shared suite actually executed (the acceptance criterion
+/// upstream reports as "vectors / checks").
+const Coverage = struct {
+    vectors: usize = 0,
+    gated: usize = 0,
+    checks: usize = 0,
+
+    fn check(self: *Coverage) void {
+        self.checks += 1;
+    }
+
+    fn report(self: Coverage, scenario: []const u8, detail: []const u8) void {
+        // Leading newline: the test runner leaves the cursor after
+        // "N/M <test name>...", so the report starts on a line of its own.
+        std.debug.print(
+            "\n[vectors] {s}: {d} vectors run, {d} gated out by `requires`, {d} checks{s}\n",
+            .{ scenario, self.vectors, self.gated, self.checks, detail },
+        );
+    }
+};
 
 // --- encode --------------------------------------------------------------------
 
@@ -138,9 +280,9 @@ fn intSlice(comptime T: type, arena: std.mem.Allocator, vals: []const std.json.V
     const out = arena.alloc(T, vals.len) catch @panic("oom");
     for (vals, out) |v, *o| {
         o.* = if (@typeInfo(T).int.signedness == .unsigned)
-            @intCast(asU64(v))
+            narrowU(T, asU64(v))
         else
-            @intCast(asI64(v));
+            narrowI(T, asI64(v));
     }
     return out;
 }
@@ -176,7 +318,7 @@ fn writeArray(os: *sofab.OStream, arena: std.mem.Allocator, id: Id, f: std.json.
 /// Encode `fields[]` into a single buffer at `offset`, returning the message
 /// bytes (without the reserved framing prefix).
 fn encodeFields(arena: std.mem.Allocator, fields: []const std.json.Value, offset: usize) ![]const u8 {
-    const buf = arena.alloc(u8, 8192) catch @panic("oom");
+    const buf = arena.alloc(u8, buffer_bytes) catch @panic("oom");
     var os = sofab.OStream.initOffset(buf, offset);
     try writeFields(&os, arena, fields);
     return buf[offset..os.bytesUsed()];
@@ -186,7 +328,7 @@ fn encodeFields(arena: std.mem.Allocator, fields: []const std.json.Value, offset
 /// so the encoder repeatedly fills, flushes, and resumes.
 fn chunkedEncode(arena: std.mem.Allocator, fields: []const std.json.Value, buf_size: usize) ![]const u8 {
     var scratch: [8]u8 = undefined;
-    var out: common.Collector(8192) = .{};
+    var out: common.Collector(buffer_bytes) = .{};
     var os = sofab.OStream.initFlush(scratch[0..buf_size], 0, &out, @TypeOf(out).push);
     try writeFields(&os, arena, fields);
     _ = os.flush();
@@ -211,7 +353,7 @@ const TakingCollector = struct {
     b: [16]u8 = @splat(reserved_fill),
     buf_size: usize,
     reserve: usize,
-    data: [8192]u8 = undefined,
+    data: [buffer_bytes]u8 = undefined,
     len: usize = 0,
     units: usize = 0,
     reservations_intact: bool = true,
@@ -227,6 +369,7 @@ const TakingCollector = struct {
                 if (b != reserved_fill) self.reservations_intact = false;
             }
             const payload = chunk[self.reserve..];
+            if (self.len + payload.len > self.data.len) @panic("taking sink overrun — raise `buffer_bytes`");
             @memcpy(self.data[self.len..][0..payload.len], payload);
             self.len += payload.len;
         }
@@ -354,6 +497,95 @@ fn expectedEventsWithSkip(arena: std.mem.Allocator, fields: []const std.json.Val
     return ev.items;
 }
 
+/// The callback kinds the fields named by `skip` are delivered through — i.e.
+/// the callbacks a receiver has to leave undeclared for this port's decoder to
+/// walk and discard exactly those fields.
+///
+/// An `array` contributes both `arrayBegin` and its element kind, because the
+/// two halves of an array field arrive through different callbacks and either
+/// can be declined on its own. A skipped `sequence_begin` contributes
+/// `sequence` and nothing else: its contents are not declined one by one, the
+/// whole scope is.
+fn declinedCallbacks(fields: []const std.json.Value, skip: []const Id) std.EnumSet(common.Callback) {
+    var set: std.EnumSet(common.Callback) = .initEmpty();
+    var depth: u32 = 0;
+    var skip_until: ?u32 = null;
+    for (fields) |f| {
+        const op = get(f, "op").?.string;
+        const id = fieldId(f);
+        if (std.mem.eql(u8, op, "sequence_begin")) {
+            if (skip_until == null and std.mem.indexOfScalar(Id, skip, id) != null) {
+                set.insert(.sequence);
+                skip_until = depth;
+            }
+            depth += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, op, "sequence_end")) {
+            depth -= 1;
+            if (skip_until) |d| {
+                if (d == depth) skip_until = null;
+            }
+            continue;
+        }
+        if (skip_until != null or std.mem.indexOfScalar(Id, skip, id) == null) continue;
+        if (std.mem.eql(u8, op, "unsigned") or std.mem.eql(u8, op, "boolean")) {
+            set.insert(.unsigned);
+        } else if (std.mem.eql(u8, op, "signed")) {
+            set.insert(.signed);
+        } else if (std.mem.eql(u8, op, "fp32")) {
+            set.insert(.fp32);
+        } else if (std.mem.eql(u8, op, "fp64")) {
+            set.insert(.fp64);
+        } else if (std.mem.eql(u8, op, "string")) {
+            set.insert(.string);
+        } else if (std.mem.eql(u8, op, "blob")) {
+            set.insert(.blob);
+        } else if (std.mem.eql(u8, op, "array")) {
+            set.insert(.array);
+            set.insert(switch (arrayKind(get(f, "element_type").?.string)) {
+                .unsigned => .unsigned,
+                .signed => .signed,
+                .fp32 => .fp32,
+                .fp64 => .fp64,
+            });
+        } else {
+            @panic("unsupported op in vectors");
+        }
+    }
+    return set;
+}
+
+/// The events a receiver that declares every callback **but** `omit` must
+/// observe for `fields[]`: everything the missing callback would have carried
+/// is gone — at every nesting level, and for array elements as well as scalar
+/// fields — and everything else still arrives, in order and with its exact
+/// value. A missing `arrayBegin` drops only the array header; the elements keep
+/// coming through the scalar callbacks. A missing `sequenceBegin` is the whole
+/// sub-tree, which is what `expectedEventsTopLevelOnly` already describes.
+fn expectedEventsWithout(
+    arena: std.mem.Allocator,
+    fields: []const std.json.Value,
+    comptime omit: common.Callback,
+) []const Event {
+    if (omit == .sequence) return expectedEventsTopLevelOnly(arena, fields);
+    var ev: std.ArrayList(Event) = .empty;
+    for (expectedEvents(arena, fields)) |e| {
+        const dropped = switch (e) {
+            .unsigned => omit == .unsigned,
+            .signed => omit == .signed,
+            .fp32 => omit == .fp32,
+            .fp64 => omit == .fp64,
+            .str => omit == .string,
+            .blob => omit == .blob,
+            .array_begin => omit == .array,
+            .sequence_begin, .sequence_end => false,
+        };
+        if (!dropped) ev.append(arena, e) catch @panic("oom");
+    }
+    return ev.items;
+}
+
 /// The events a receiver that **cannot descend** must observe for `fields[]`:
 /// only the top-level, non-sequence fields. A visitor declaring no
 /// `sequenceBegin` is never told a scope was entered, so the decoder consumes
@@ -414,10 +646,16 @@ test "shared vectors are present and carry capability tags" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const vectors = parseVectors(arena_state.allocator());
-    try std.testing.expect(vectors.len > 0);
+    // The asset is a verbatim copy of corelib-c-cpp's (CORELIB_PLAN §7.1/§8);
+    // the generation that added the skip matrix has 131 vectors. A copy that
+    // regressed to an older, smaller file is caught here rather than by a
+    // scenario quietly covering less.
+    try std.testing.expect(vectors.len >= 131);
     var tagged: usize = 0;
     for (vectors) |v| {
         if (get(v, "requires") != null) tagged += 1;
+        // Every tag in the file resolves; an unknown one panics here.
+        _ = gatedOut(v);
     }
     try std.testing.expect(tagged > 0);
 }
@@ -428,23 +666,30 @@ test "all shared vectors conform (encode, chunked-encode, decode, chunked-decode
     const arena = arena_state.allocator();
     const vectors = parseVectors(arena);
 
-    var ran: usize = 0;
+    var cov: Coverage = .{};
     for (vectors) |vec| {
-        ran += 1;
         const name = get(vec, "name").?.string;
         errdefer std.debug.print("vector [{s}] failed\n", .{name});
+        if (gatedOut(vec)) {
+            cov.gated += 1;
+            continue;
+        }
+        cov.vectors += 1;
 
-        const offset: usize = if (get(vec, "offset")) |o| @intCast(asU64(o)) else 0;
+        const offset: usize = if (get(vec, "offset")) |o| narrowU(usize, asU64(o)) else 0;
         const fields = get(vec, "fields").?.array.items;
         const expected_bytes = common.hexToBytes(arena, get(get(vec, "serialized").?, "hex").?.string);
+        assertFits(name, expected_bytes.len + offset);
 
         // 1. Vector encode: replay fields, bytes must match the ground truth.
         const encoded = try encodeFields(arena, fields, offset);
         try std.testing.expectEqualSlices(u8, expected_bytes, encoded);
+        cov.check();
 
         // 2. Chunked encode: stream out through tiny flush buffers.
         for ([_]usize{ 1, 3, 7 }) |bs| {
             try std.testing.expectEqualSlices(u8, expected_bytes, try chunkedEncode(arena, fields, bs));
+            cov.check();
         }
 
         // 2b. Take-and-replace encode (§5.1): the sink takes each buffer and
@@ -457,18 +702,41 @@ test "all shared vectors conform (encode, chunked-encode, decode, chunked-decode
                 expected_bytes,
                 try takingEncode(arena, fields, cfg[0], cfg[1]),
             );
+            cov.check();
         }
 
         // 3. Vector decode: feed the official bytes, recovered fields must match.
         const want = expectedEvents(arena, fields);
         try common.expectEventsEqual(want, try decodeAll(arena, expected_bytes));
+        cov.check();
 
         // 4. Chunked decode: one byte at a time yields identical events.
         try common.expectEventsEqual(want, try decodeOneByteAtATime(arena, expected_bytes));
+        cov.check();
     }
 
-    try std.testing.expect(ran > 0);
+    cov.report("encode/decode", "");
+    try std.testing.expect(cov.vectors > 0);
 }
+
+/// Per-group tallies for the skip scenario, so the run states that the whole
+/// skip matrix executed rather than just "some vectors with `skip_ids`".
+const SkipGroups = struct {
+    matrix_total: usize = 0,
+    matrix_run: usize = 0,
+    plain_total: usize = 0,
+    plain_run: usize = 0,
+
+    fn count(self: *SkipGroups, group: []const u8, was_run: bool) void {
+        if (std.mem.eql(u8, group, "skip/matrix")) {
+            self.matrix_total += 1;
+            if (was_run) self.matrix_run += 1;
+        } else if (std.mem.eql(u8, group, "skip")) {
+            self.plain_total += 1;
+            if (was_run) self.plain_run += 1;
+        }
+    }
+};
 
 test "skip_ids vectors conform (whole and chunked)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -476,15 +744,30 @@ test "skip_ids vectors conform (whole and chunked)" {
     const arena = arena_state.allocator();
     const vectors = parseVectors(arena);
 
-    var seen: usize = 0;
+    var cov: Coverage = .{};
+    var groups: SkipGroups = .{};
+    var longest_skip_list: usize = 0;
+    // The decoder-side pass: how many decodes ran through a visitor that
+    // declines a callback, and which callbacks were declined at least once.
+    var declined_decodes: usize = 0;
+    var declined_seen: std.EnumSet(common.Callback) = .initEmpty();
     for (vectors) |vec| {
         const skip_json = get(vec, "skip_ids") orelse continue;
-        seen += 1;
         const name = get(vec, "name").?.string;
         errdefer std.debug.print("skip vector [{s}] failed\n", .{name});
+        const runnable = !gatedOut(vec);
+        groups.count(get(vec, "group").?.string, runnable);
+        if (!runnable) {
+            cov.gated += 1;
+            continue;
+        }
+        cov.vectors += 1;
 
+        // The skip set is taken whole: it is sized from the asset, never from a
+        // fixed bound, so no id can be dropped off the end and end up *read*.
         const skip = arena.alloc(Id, skip_json.array.items.len) catch @panic("oom");
-        for (skip_json.array.items, skip) |v, *s| s.* = @intCast(asU64(v));
+        for (skip_json.array.items, skip) |v, *sk| sk.* = narrowU(Id, asU64(v));
+        longest_skip_list = @max(longest_skip_list, skip.len);
 
         const fields = get(vec, "fields").?.array.items;
         const bytes = common.hexToBytes(arena, get(get(vec, "serialized").?, "hex").?.string);
@@ -496,16 +779,86 @@ test "skip_ids vectors conform (whole and chunked)" {
         var rec = common.SkipRecorder.init(arena, skip);
         try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(bytes, &rec));
         try common.expectEventsEqual(want, rec.events());
+        cov.check();
 
         var rec2 = common.SkipRecorder.init(arena, skip);
         var is = sofab.IStream.init();
         for (bytes) |b| _ = try is.feed(&.{b}, &rec2);
         try std.testing.expectEqual(sofab.Status.complete, is.status());
         try common.expectEventsEqual(want, rec2.events());
+        cov.check();
+
+        // …and the same vector through the decoder's *own* skip path.
+        //
+        // The two decodes above put the whole message through a visitor that
+        // declares every callback and drops the ids it was told to ignore. That
+        // is an event filter: it proves the skipped fields decode, not that
+        // anything was skipped — the decoder delivered them. This port has no
+        // per-id decline API to express `skip_ids` with (declining is per
+        // callback kind, through `@hasDecl`, and per sub-sequence, through the
+        // absence of `sequenceBegin`), so the way a receiver here actually
+        // refuses the fields `skip_ids` names is to not declare their callback.
+        //
+        // So decode the vector once more per callback kind its skipped fields
+        // use, through a visitor missing exactly that callback. Now the decoder
+        // has to walk each of those fields itself — past its length word, its
+        // element count, its element width, its end marker — and every field
+        // that follows is an anchor that catches a walk which ended on the
+        // wrong byte. Whole and one byte at a time, so a skip is also exercised
+        // across chunk boundaries.
+        const declined = declinedCallbacks(fields, skip);
+        try std.testing.expect(declined.count() > 0);
+        declined_seen.setUnion(declined);
+        inline for (comptime std.enums.values(common.Callback)) |cb| {
+            if (declined.contains(cb)) {
+                const want_cb = expectedEventsWithout(arena, fields, cb);
+                const Visitor = common.Declining(cb);
+
+                var dec = Visitor.init(arena);
+                try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(bytes, &dec));
+                try common.expectEventsEqual(want_cb, dec.events());
+                cov.check();
+
+                var dec2 = Visitor.init(arena);
+                var is2 = sofab.IStream.init();
+                for (bytes) |b| _ = try is2.feed(&.{b}, &dec2);
+                try std.testing.expectEqual(sofab.Status.complete, is2.status());
+                try common.expectEventsEqual(want_cb, dec2.events());
+                cov.check();
+
+                declined_decodes += 2;
+            }
+        }
     }
 
-    // Every shared skip vector is supported in this build.
-    try std.testing.expect(seen >= 8);
+    var detail_buf: [192]u8 = undefined;
+    cov.report("skip + chunked skip", std.fmt.bufPrint(
+        &detail_buf,
+        " (skip/matrix {d}/{d}, skip {d}/{d}, longest skip_ids {d}, {d} decoder-skip decodes over {d}/{d} callback kinds)",
+        .{
+            groups.matrix_run,     groups.matrix_total,
+            groups.plain_run,      groups.plain_total,
+            longest_skip_list,     declined_decodes,
+            declined_seen.count(), std.enums.values(common.Callback).len,
+        },
+    ) catch unreachable);
+
+    // The generation of the asset that added the skip matrix carries 36
+    // `skip/matrix` and 16 `skip` vectors, and 58 vectors with `skip_ids` in
+    // total. Asserting the floors keeps a stale copy of the file — or a loader
+    // that stopped seeing part of it — from passing quietly.
+    try std.testing.expect(groups.matrix_total >= 36);
+    try std.testing.expect(groups.plain_total >= 16);
+    try std.testing.expect(cov.vectors + cov.gated >= 58);
+    // Nothing in this build is gated out, so everything with `skip_ids` ran.
+    try std.testing.expectEqual(@as(usize, 0), cov.gated);
+    // …and the longest list in the asset (9 ids) arrived whole.
+    try std.testing.expect(longest_skip_list >= 9);
+    // The matrix declines every skippable construct in turn, so every callback
+    // kind must have been left undeclared at least once — otherwise the
+    // decoder-side pass silently covers less than the file offers.
+    try std.testing.expectEqual(std.enums.values(common.Callback).len, declined_seen.count());
+    try std.testing.expect(declined_decodes >= 2 * cov.vectors);
 }
 
 test "every vector auto-skips its sub-sequences for a visitor that cannot descend" {
@@ -517,10 +870,16 @@ test "every vector auto-skips its sub-sequences for a visitor that cannot descen
     // Vectors whose events a non-descending visitor must *not* see in full —
     // the ones that actually carry a sequence. Counted so this test cannot
     // silently degrade into "all vectors are flat anyway".
+    var cov: Coverage = .{};
     var nested: usize = 0;
     for (vectors) |vec| {
         const name = get(vec, "name").?.string;
         errdefer std.debug.print("auto-skip vector [{s}] failed\n", .{name});
+        if (gatedOut(vec)) {
+            cov.gated += 1;
+            continue;
+        }
+        cov.vectors += 1;
 
         const fields = get(vec, "fields").?.array.items;
         const bytes = common.hexToBytes(arena, get(get(vec, "serialized").?, "hex").?.string);
@@ -530,6 +889,7 @@ test "every vector auto-skips its sub-sequences for a visitor that cannot descen
         var rec = common.FlatRecorder.init(arena);
         try std.testing.expectEqual(sofab.Status.complete, try sofab.decode(bytes, &rec));
         try common.expectEventsEqual(want, rec.events());
+        cov.check();
 
         // Chunk-independence: the same events one byte at a time.
         var rec2 = common.FlatRecorder.init(arena);
@@ -537,8 +897,10 @@ test "every vector auto-skips its sub-sequences for a visitor that cannot descen
         for (bytes) |b| _ = try is.feed(&.{b}, &rec2);
         try std.testing.expectEqual(sofab.Status.complete, is.status());
         try common.expectEventsEqual(want, rec2.events());
+        cov.check();
     }
 
+    cov.report("auto-skip (non-descending visitor)", "");
     try std.testing.expect(nested >= 8);
 }
 
@@ -547,7 +909,7 @@ test "invalid_utf8 vectors: every string writer honours the encode outcome (§6.
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var ran: usize = 0;
+    var cov: Coverage = .{};
     for (parseInvalidUtf8(arena)) |vec| {
         const name = get(vec, "name").?.string;
         errdefer std.debug.print("invalid_utf8 vector [{s}] failed\n", .{name});
@@ -555,12 +917,13 @@ test "invalid_utf8 vectors: every string writer honours the encode outcome (§6.
         // one would need its own handling rather than being silently ignored.
         try std.testing.expectEqualStrings("invalid_argument", get(vec, "encode_outcome").?.string);
 
-        const id: Id = @intCast(asU64(get(vec, "id").?));
+        const id = narrowU(Id, asU64(get(vec, "id").?));
         const payload = common.hexToBytes(arena, get(vec, "string_hex").?.string);
         const expected = common.hexToBytes(arena, get(vec, "serialized_hex").?.string);
-        ran += 1;
+        cov.vectors += 1;
 
         var buf: [64]u8 = undefined;
+        if (expected.len > buf.len) @panic("invalid_utf8 vector outgrew the encode buffer — raise it");
 
         // Both spellings of "write a string field" must agree: `writeString`
         // and the generic `writeFixlen(.string)` reach the same wire shape, so
@@ -582,6 +945,7 @@ test "invalid_utf8 vectors: every string writer honours the encode outcome (§6.
                 try res;
                 try std.testing.expectEqualSlices(u8, expected, buf[0..os.bytesUsed()]);
             }
+            cov.check();
         }
 
         // `blob` is opaque bytes and is never validated, in either build: the
@@ -589,9 +953,11 @@ test "invalid_utf8 vectors: every string writer honours the encode outcome (§6.
         var os_blob = sofab.OStream.init(&buf);
         try os_blob.writeBlob(id, payload);
         try std.testing.expect(os_blob.bytesUsed() > payload.len);
+        cov.check();
     }
 
+    cov.report("invalid_utf8 encode", "");
     // The list is part of the shared asset; an empty run would mean this suite
     // silently stopped covering the encode side.
-    try std.testing.expect(ran >= 8);
+    try std.testing.expect(cov.vectors >= 8);
 }
