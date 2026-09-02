@@ -134,7 +134,8 @@ test "an over-cap array count is refused at the header, before any allocation" {
     // `.complete` — but not because a policy rejection leaves the outcome
     // alone. §6.3 calls this rejection **terminal**, and a refusal the decoder
     // can see does end the decode: raising `error.LimitExceeded` out of
-    // `fixlenBegin` latches and reports `Status.refused` (src/istream.zig).
+    // `fixlenBegin` latches it, and every later `feed` raises that same code
+    // (src/istream.zig).
     // This refusal the decoder never sees. `arrayBegin` is infallible by
     // design, so the cap is compared inside the callback and the verdict is
     // held in `v.lim` for generated `decode` to report; the decoder consumed a

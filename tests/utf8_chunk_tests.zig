@@ -212,8 +212,9 @@ test "the UTF-8 verdict of a prefixed vector is the same at every chunk split" {
         // each at its own absolute offset, and the verdict is unchanged.
         var sink: StringSink = .{};
         var is = sofab.IStream.init();
-        for (message) |b| _ = try is.feed(&.{b}, &sink);
-        try std.testing.expectEqual(sofab.Status.complete, is.status());
+        var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+        for (message) |b| st = try is.feed(&.{b}, &sink);
+        try std.testing.expectEqual(sofab.Status.complete, st);
         try std.testing.expect(sink.contiguous);
         try std.testing.expectEqual(payload.len, sink.chunks);
         try std.testing.expectEqual(@as(usize, 1), sink.completions);
@@ -330,8 +331,9 @@ test "an invalid-UTF-8 string inside a skipped sub-sequence is never delivered" 
         // crosses every chunk boundary there is.
         var sink: StringSink = .{};
         var is = sofab.IStream.init();
-        for (message) |b| _ = try is.feed(&.{b}, &sink);
-        try std.testing.expectEqual(sofab.Status.complete, is.status());
+        var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+        for (message) |b| st = try is.feed(&.{b}, &sink);
+        try std.testing.expectEqual(sofab.Status.complete, st);
         try std.testing.expectEqual(@as(usize, 0), sink.chunks);
         try std.testing.expectEqual(@as(?bool, null), sink.verdict);
     }

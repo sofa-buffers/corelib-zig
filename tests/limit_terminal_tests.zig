@@ -10,9 +10,10 @@
 //!
 //! What terminal costs the decoder is exactly what §5.2.1 costs it for `INVALID`
 //! ("regardless of what follows … no — terminal") and what `src/istream.zig`
-//! already implements for `error.InvalidMessage`: the verdict is latched, so the
-//! status accessor keeps reporting it and a further `feed` repeats it instead of
-//! resynchronizing on the bytes that follow the refused construct. §5.2.3's
+//! already implements for `error.InvalidMessage`: the verdict is latched, so a
+//! further `feed` — an empty end-of-input probe included, which is how a caller
+//! re-asks where the decoder stands — repeats it instead of resynchronizing on
+//! the bytes that follow the refused construct. §5.2.3's
 //! ordering ("a decoder **MUST NOT** report `INCOMPLETE` for input it has already
 //! determined malformed") sets the floor these tests measure against: answering
 //! `COMPLETE` about bytes the decoder itself just refused is further still from
@@ -23,7 +24,7 @@
 //! position the byte stream no longer has, and the refused field's **payload**
 //! is then read as field headers: the visitor is handed fields the sender never
 //! wrote. So these tests assert on the delivered **events**, not only on the
-//! status — and they assert it for the message fed whole and fed one byte at a
+//! outcome — and they assert it for the message fed whole and fed one byte at a
 //! time alike, since a verdict that depends on where the chunk boundaries fell
 //! is the divergence MESSAGE_SPEC §7.2 item 4 forbids.
 
@@ -151,7 +152,7 @@ fn feedRefusing(is: *sofab.IStream, v: *CappingRecorder, msg: []const u8, chunk:
 // rejection" that "terminates a decode" — read with §5.2.1 (a terminal verdict is
 // "regardless of what follows") and §5.2.3 (a decoder must not report a
 // keep-going outcome about input it has already refused).
-test "CORELIB_ZIG-01: a LimitExceeded refusal is terminal — the status holds, a further feed does not resume, and no field the sender never wrote is delivered" {
+test "CORELIB_ZIG-01: a LimitExceeded refusal is terminal — the verdict holds, a further feed does not resume, and no field the sender never wrote is delivered" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -173,16 +174,15 @@ test "CORELIB_ZIG-01: a LimitExceeded refusal is terminal — the status holds, 
         try feedRefusing(&is, &v, &msg, chunk);
         try std.testing.expectEqual(@as(usize, 1), v.refusals);
 
-        // (a) the status accessor still reports the terminal verdict.
-        try expectTerminalStatus("status after the refusal", is.status());
-
-        // (b) a further feed re-reports it instead of decoding more — an empty
-        //     end-of-input probe and real bytes alike. Feeding the refused
-        //     field's own payload is the caller behaviour the port documents as
-        //     legitimate ("must not poison the decoder", src/istream.zig:286-290).
+        // (a)+(b) the verdict holds, and a further feed re-reports it instead
+        //     of decoding more — an empty end-of-input probe and real bytes
+        //     alike. The empty probe is the whole of (a): with no status
+        //     accessor to ask, re-asking the decoder where it stands *is* a feed
+        //     of zero bytes. Feeding the refused field's own payload is the
+        //     caller behaviour a resynchronizing decoder would fabricate from.
         try expectTerminalFeed("empty end-of-input probe", &is, &.{}, &v);
         try expectTerminalFeed("feed of the refused payload", &is, payload, &v);
-        try expectTerminalStatus("status after the further feeds", is.status());
+        try expectTerminalFeed("empty probe after the further feeds", &is, &.{}, &v);
 
         // (c) and nothing reached the visitor. The sender wrote one field; the
         //     decoder refused it; therefore no event at all is the only correct
@@ -218,13 +218,13 @@ test "CORELIB_ZIG-01: a LimitExceeded refusal inside a sequence is terminal too 
         try std.testing.expectEqual(@as(usize, 1), v.refusals);
 
         // (a) an open sequence must not downgrade the terminal verdict to
-        //     INCOMPLETE: §5.2.3 forbids a keep-going outcome about refused input.
-        try expectTerminalStatus("status after the refusal in a sequence", is.status());
+        //     INCOMPLETE: §5.2.3 forbids a keep-going outcome about refused
+        //     input, and an empty probe is how the caller re-asks.
+        try expectTerminalFeed("empty end-of-input probe", &is, &.{}, &v);
 
         // (b) no resumption inside the desynchronised scope.
-        try expectTerminalFeed("empty end-of-input probe", &is, &.{}, &v);
         try expectTerminalFeed("feed of the refused payload", &is, payload, &v);
-        try expectTerminalStatus("status after the further feeds", is.status());
+        try expectTerminalFeed("empty probe after the further feeds", &is, &.{}, &v);
 
         // (c) the scope's own `sequenceBegin` stands; nothing else does.
         try common.expectEventsEqual(&want, v.events());

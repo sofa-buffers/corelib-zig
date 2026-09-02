@@ -56,10 +56,11 @@ fn expectChunkedEquals(arena: std.mem.Allocator, message: []const u8, want: []co
     var rec = common.Recorder.init(arena);
     var is = sofab.IStream.init();
     var pos: usize = 0;
+    var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
     while (pos < message.len) : (pos += cs) {
-        _ = try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
+        st = try is.feed(message[pos..@min(pos + cs, message.len)], &rec);
     }
-    try std.testing.expectEqual(sofab.Status.complete, is.status());
+    try std.testing.expectEqual(sofab.Status.complete, st);
     try common.expectEventsEqual(want, rec.events.items);
 }
 

@@ -204,42 +204,46 @@ boundaries fall.
 
 `IStream.feed` takes chunks of any size, suspends/resumes at any byte boundary,
 and drives the same visitor. `feed` returns the message-boundary `Status` after
-each chunk (`status()` re-queries it without feeding more): `.complete` at a
-clean field boundary and `.incomplete` when the bytes ended inside a field or
-with a sequence still open. There is **no** `finish()`/`finalize()` call. The
-caller owns end-of-input and decides, from its own framing, whether a trailing
+each chunk: `.complete` at a clean field boundary and `.incomplete` when the
+bytes ended inside a field or with a sequence still open. That call is the whole
+answer — there is **no** `finish()`/`finalize()` and **no** separate status
+accessor beside it; to re-ask without new bytes, feed an empty chunk. The caller
+owns end-of-input and decides, from its own framing, whether a trailing
 `.incomplete` is a truncation failure; malformed bytes are rejected as
 `error.InvalidMessage` by `feed` itself.
 
 ```zig
 var sink: My = .{};
 var is = sofab.IStream.init();
-var status = sofab.Status.complete;
+var status = sofab.Status.complete; // fed nothing: at a field boundary
 while (transport.nextChunk()) |chunk| { // 7 bytes at a time, or 1, or 64k
     status = try is.feed(chunk, &sink); // error.InvalidMessage on malformed input
 }
-switch (status) { // == is.status()
+switch (status) {
     .complete => {},
     .incomplete => {}, // stream ended mid-message: your framing decides
     .invalid => {},    // unreachable after a `try` — see below
-    .refused => {},    // likewise: a visitor callback refused a field
 }
 ```
 
 **A rejection is terminal.** The decoder latches `error.InvalidMessage` rather
 than resynchronizing after the malformed construct: every further `feed` — a
 whole valid message, a truncated prefix and an empty end-of-input probe alike —
-returns `error.InvalidMessage` again, and `status()` reports the third `Status`,
-`.invalid`. That is the only way `.invalid` is ever observed, since
-`feed`/`decode` surface the outcome as the error itself. `is.reset()` clears the
-latch — the only way out — and readies the decoder for the next message. A
-receiver-side `error.LimitExceeded` raised out of a visitor callback latches the
-same way — CORELIB_PLAN §6.3 calls it a *terminal* policy rejection — but keeps
-its own identity: every further `feed` returns `error.LimitExceeded` again, and
-`status()` reports the fourth `Status`, `.refused`, never `.invalid`. `.refused`
-is one outcome for every terminal refusal of well-formed bytes, not one per
-code — which code did the refusing is read off the error `feed` re-reports, and
-that is where §6.3 keeps its five codes apart.
+returns `error.InvalidMessage` again. `is.reset()` clears the latch — the only
+way out — and readies the decoder for the next message. A receiver-side
+`error.LimitExceeded` raised out of a visitor callback latches the same way —
+CORELIB_PLAN §6.3 calls it a *terminal* policy rejection — but keeps its own
+identity: every further `feed` returns `error.LimitExceeded` again, never
+`InvalidMessage`, which is where §6.3 keeps its five codes apart.
+
+**One fact, one place to read it.** `feed` publishes the outcome on its two
+channels — the `Status` it returns, the error it raises — and this library
+offers no second surface that answers the same question: §6.3 allows a refusal
+to be surfaced either as a fourth outcome or as "a terminal failure carrying the
+`LimitExceeded` code on the error channel", and this port takes the error
+channel. `Status.invalid` is kept as the name of MESSAGE_SPEC §7's third outcome
+for callers that must map the caught `error.InvalidMessage` back onto it; `feed`
+itself never returns it.
 
 The error set also carries `error.LimitExceeded`, for a **receiver-configured**
 decode limit on an unbounded field (`max_dyn_array_count`, `max_dyn_string_len`,
@@ -356,6 +360,7 @@ pub const Point = struct {
     pub const Decoder = struct {
         is: sofab.IStream = sofab.IStream.init(),
         v: _dec_Point,
+        last: sofab.Status = .complete, // what the last feed answered
 
         /// Feed the next chunk, of any size. `.complete` means the bytes ended
         /// on a field boundary, `.incomplete` mid-field — neither answers
@@ -363,17 +368,15 @@ pub const Point = struct {
         pub fn feed(self: *Decoder, chunk: []const u8) DecodeError!sofab.Status {
             const st = try self.is.feed(chunk, &self.v);
             if (self.v.inv) return error.InvalidMessage;
+            self.last = st;
             return st;
         }
 
-        /// The outcome for everything fed so far, without feeding more.
-        pub fn status(self: *const Decoder) sofab.Status {
-            return self.is.status();
-        }
-
         /// Declare end-of-input: a stream that ended mid-field fails here.
+        /// The corelib publishes the outcome once, through `feed`, so this
+        /// layer keeps what `feed` last answered rather than asking again.
         pub fn finish(self: *const Decoder) DecodeError!void {
-            if (self.is.status() == .incomplete) return error.IncompleteMessage;
+            if (self.last == .incomplete) return error.IncompleteMessage;
         }
     };
 
