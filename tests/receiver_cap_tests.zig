@@ -131,8 +131,16 @@ test "an over-cap array count is refused at the header, before any allocation" {
     try std.testing.expectEqual(@as(usize, 0), v.m.dyn.len);
     // Before the allocation it exists to prevent.
     try std.testing.expectEqual(@as(usize, 0), counter.calls);
-    // The bytes are well-formed; the refusal is policy, not malformation
-    // (§6.3), so the decoder's own outcome is untouched by it.
+    // `.complete` — but not because a policy rejection leaves the outcome
+    // alone. §6.3 calls this rejection **terminal**, and a refusal the decoder
+    // can see does end the decode: raising `error.LimitExceeded` out of
+    // `fixlenBegin` latches and reports `Status.refused` (src/istream.zig).
+    // This refusal the decoder never sees. `arrayBegin` is infallible by
+    // design, so the cap is compared inside the callback and the verdict is
+    // held in `v.lim` for generated `decode` to report; the decoder consumed a
+    // well-formed message whole, and `.complete` is its truthful answer about
+    // the bytes. That a cap enforced on this route cannot terminate the decode
+    // is a gap in the callback contract, not a property of policy rejections.
     try std.testing.expectEqual(sofab.Status.complete, st);
 }
 

@@ -222,6 +222,7 @@ switch (status) { // == is.status()
     .complete => {},
     .incomplete => {}, // stream ended mid-message: your framing decides
     .invalid => {},    // unreachable after a `try` — see below
+    .refused => {},    // likewise: a visitor callback refused a field
 }
 ```
 
@@ -231,7 +232,14 @@ whole valid message, a truncated prefix and an empty end-of-input probe alike �
 returns `error.InvalidMessage` again, and `status()` reports the third `Status`,
 `.invalid`. That is the only way `.invalid` is ever observed, since
 `feed`/`decode` surface the outcome as the error itself. `is.reset()` clears the
-latch — the only way out — and readies the decoder for the next message.
+latch — the only way out — and readies the decoder for the next message. A
+receiver-side `error.LimitExceeded` raised out of a visitor callback latches the
+same way — CORELIB_PLAN §6.3 calls it a *terminal* policy rejection — but keeps
+its own identity: every further `feed` returns `error.LimitExceeded` again, and
+`status()` reports the fourth `Status`, `.refused`, never `.invalid`. `.refused`
+is one outcome for every terminal refusal of well-formed bytes, not one per
+code — which code did the refusing is read off the error `feed` re-reports, and
+that is where §6.3 keeps its five codes apart.
 
 The error set also carries `error.LimitExceeded`, for a **receiver-configured**
 decode limit on an unbounded field (`max_dyn_array_count`, `max_dyn_string_len`,
