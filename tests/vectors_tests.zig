@@ -618,8 +618,9 @@ fn decodeAll(arena: std.mem.Allocator, bytes: []const u8) ![]const Event {
 fn decodeOneByteAtATime(arena: std.mem.Allocator, bytes: []const u8) ![]const Event {
     var rec = common.Recorder.init(arena);
     var is = sofab.IStream.init();
-    for (bytes) |b| _ = try is.feed(&.{b}, &rec);
-    try std.testing.expectEqual(sofab.Status.complete, is.status());
+    var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+    for (bytes) |b| st = try is.feed(&.{b}, &rec);
+    try std.testing.expectEqual(sofab.Status.complete, st);
     return rec.events.items;
 }
 
@@ -783,8 +784,9 @@ test "skip_ids vectors conform (whole and chunked)" {
 
         var rec2 = common.SkipRecorder.init(arena, skip);
         var is = sofab.IStream.init();
-        for (bytes) |b| _ = try is.feed(&.{b}, &rec2);
-        try std.testing.expectEqual(sofab.Status.complete, is.status());
+        var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+        for (bytes) |b| st = try is.feed(&.{b}, &rec2);
+        try std.testing.expectEqual(sofab.Status.complete, st);
         try common.expectEventsEqual(want, rec2.events());
         cov.check();
 
@@ -821,8 +823,9 @@ test "skip_ids vectors conform (whole and chunked)" {
 
                 var dec2 = Visitor.init(arena);
                 var is2 = sofab.IStream.init();
-                for (bytes) |b| _ = try is2.feed(&.{b}, &dec2);
-                try std.testing.expectEqual(sofab.Status.complete, is2.status());
+                var st_cb: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+                for (bytes) |b| st_cb = try is2.feed(&.{b}, &dec2);
+                try std.testing.expectEqual(sofab.Status.complete, st_cb);
                 try common.expectEventsEqual(want_cb, dec2.events());
                 cov.check();
 
@@ -894,8 +897,9 @@ test "every vector auto-skips its sub-sequences for a visitor that cannot descen
         // Chunk-independence: the same events one byte at a time.
         var rec2 = common.FlatRecorder.init(arena);
         var is = sofab.IStream.init();
-        for (bytes) |b| _ = try is.feed(&.{b}, &rec2);
-        try std.testing.expectEqual(sofab.Status.complete, is.status());
+        var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+        for (bytes) |b| st = try is.feed(&.{b}, &rec2);
+        try std.testing.expectEqual(sofab.Status.complete, st);
         try common.expectEventsEqual(want, rec2.events());
         cov.check();
     }

@@ -63,8 +63,9 @@ fn expectDecode(
 
     var rec2 = common.Recorder.init(arena);
     var is2 = sofab.IStream.init();
-    for (bytes) |b| _ = try is2.feed(&.{b}, &rec2);
-    try std.testing.expectEqual(want_status, is2.status());
+    var chunked_status: sofab.Status = .complete; // fed nothing: at a field boundary
+    for (bytes) |b| chunked_status = try is2.feed(&.{b}, &rec2);
+    try std.testing.expectEqual(want_status, chunked_status);
     try common.expectEventsEqual(want, rec2.events.items);
 }
 
@@ -77,8 +78,9 @@ fn expectInvalid(arena: std.mem.Allocator, bytes: []const u8) !void {
     var rec2 = common.Recorder.init(arena);
     var is2 = sofab.IStream.init();
     const chunked: anyerror!sofab.Status = blk: {
-        for (bytes) |b| _ = is2.feed(&.{b}, &rec2) catch |e| break :blk e;
-        break :blk is2.status();
+        var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+        for (bytes) |b| st = is2.feed(&.{b}, &rec2) catch |e| break :blk e;
+        break :blk st;
     };
     try std.testing.expectError(error.InvalidMessage, chunked);
 }
@@ -321,8 +323,9 @@ test "F-0042: the header fires once per array field, never per element" {
     const bytes = OPEN ++ [_]u8{ 0x05, 0x28, 0x41 } ++ [_]u8{0} ** 320 ++ CLOSE;
     var rec = common.Recorder.init(arena);
     var is = sofab.IStream.init();
-    for (bytes) |b| _ = try is.feed(&.{b}, &rec);
-    try std.testing.expectEqual(sofab.Status.complete, is.status());
+    var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+    for (bytes) |b| st = try is.feed(&.{b}, &rec);
+    try std.testing.expectEqual(sofab.Status.complete, st);
 
     var headers: usize = 0;
     for (rec.events.items) |e| switch (e) {

@@ -45,8 +45,9 @@ test "a visitor that cannot descend skips the sub-sequence (issue #44)" {
     // Same verdict, same values, one byte at a time.
     var chunked: FlatOnly = .{};
     var is = sofab.IStream.init();
-    for (bytes) |b| _ = try is.feed(&.{b}, &chunked);
-    try std.testing.expectEqual(sofab.Status.complete, is.status());
+    var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+    for (bytes) |b| st = try is.feed(&.{b}, &chunked);
+    try std.testing.expectEqual(sofab.Status.complete, st);
     try std.testing.expectEqual(@as(u64, 1), chunked.hits[0]);
 
     // A visitor that *does* declare `sequenceBegin` opted into the scope and
@@ -114,8 +115,9 @@ test "every payload shape inside a skipped scope is discarded, and the next fiel
     // payloads and arrays that straddle every possible boundary.
     var chunked = common.FlatRecorder.init(arena);
     var is = sofab.IStream.init();
-    for (message) |b| _ = try is.feed(&.{b}, &chunked);
-    try std.testing.expectEqual(sofab.Status.complete, is.status());
+    var st: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
+    for (message) |b| st = try is.feed(&.{b}, &chunked);
+    try std.testing.expectEqual(sofab.Status.complete, st);
     try common.expectEventsEqual(want_flat, chunked.events());
 
     // …and in a few odd chunk sizes, where a boundary can fall mid-array.
@@ -123,10 +125,11 @@ test "every payload shape inside a skipped scope is discarded, and the next fiel
         var rec = common.FlatRecorder.init(arena);
         var s = sofab.IStream.init();
         var i: usize = 0;
+        var st_n: sofab.Status = .complete; // a decoder fed nothing sits at a field boundary
         while (i < message.len) : (i += n) {
-            _ = try s.feed(message[i..@min(i + n, message.len)], &rec);
+            st_n = try s.feed(message[i..@min(i + n, message.len)], &rec);
         }
-        try std.testing.expectEqual(sofab.Status.complete, s.status());
+        try std.testing.expectEqual(sofab.Status.complete, st_n);
         try common.expectEventsEqual(want_flat, rec.events());
     }
 

@@ -68,6 +68,7 @@ pub const Point = struct {
     pub const Decoder = struct {
         is: sofab.IStream = sofab.IStream.init(),
         v: _dec_Point,
+        last: sofab.Status = .complete, // what the last feed answered
 
         /// Feed the next chunk, of any size. `.complete` means the bytes ended
         /// on a field boundary, `.incomplete` mid-field — neither answers
@@ -75,17 +76,15 @@ pub const Point = struct {
         pub fn feed(self: *Decoder, chunk: []const u8) DecodeError!sofab.Status {
             const st = try self.is.feed(chunk, &self.v);
             if (self.v.inv) return error.InvalidMessage;
+            self.last = st;
             return st;
         }
 
-        /// The outcome for everything fed so far, without feeding more.
-        pub fn status(self: *const Decoder) sofab.Status {
-            return self.is.status();
-        }
-
         /// Declare end-of-input: a stream that ended mid-field fails here.
+        /// The corelib publishes the outcome once, through `feed`, so this
+        /// layer keeps what `feed` last answered rather than asking again.
         pub fn finish(self: *const Decoder) DecodeError!void {
-            if (self.is.status() == .incomplete) return error.IncompleteMessage;
+            if (self.last == .incomplete) return error.IncompleteMessage;
         }
     };
 
@@ -181,7 +180,6 @@ test "README: the generated one-shot and streaming paths" {
     try std.testing.expectEqual(@as(i32, 4), got.y);
     try std.testing.expectEqualSlices(u8, wire, sink.buf[0..sink.len]);
     try std.testing.expectEqual(sofab.Status.complete, st);
-    try std.testing.expectEqual(sofab.Status.complete, dec.status());
     try std.testing.expectEqual(Point{ .x = 3, .y = 4 }, out);
 }
 
