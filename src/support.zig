@@ -286,6 +286,32 @@ pub const PayloadAcc = struct {
         return self.push(a, total, offset, chunk);
     }
 
+    /// The receiver cap at the **length header**, for a generated `fixlenBegin`
+    /// to call before a single payload byte is asked for (CORELIB_PLAN §6.2.1,
+    /// §6.3). `total` is the length the header announced; a `total` above `cap`
+    /// is `error.LimitExceeded`.
+    ///
+    /// `takeCapped` compares the same two numbers, but it can only run once a
+    /// payload chunk arrives — and a message may **end at the length word**:
+    /// `02 a2 06` declares a 100-byte string and stops. Nothing then calls
+    /// `string()`, so a cap that lives only in `takeCapped` never fires and the
+    /// decode answers INCOMPLETE — the outcome MESSAGE_SPEC §5.2.1 reserves for
+    /// input more bytes *can* change, which after a ceiling has fired is a false
+    /// statement about the state. §6.2.1 puts the enforcement point at the
+    /// count/length header for exactly that reason, and this is the call that
+    /// puts it there. It is also what makes the amplification shape cheap: six
+    /// bytes claiming a gigabyte are refused without waiting for the gigabyte.
+    ///
+    /// Raising this out of `fixlenBegin` ends the decode terminally, because
+    /// the decoder sees it (`src/istream.zig`). `takeCapped` stays the second
+    /// line of defence for the payload that does arrive; the verdict just must
+    /// not *depend* on one arriving.
+    ///
+    /// `cap` is used for this one comparison and not retained.
+    pub fn beginCapped(_: *const PayloadAcc, total: usize, cap: usize) error{LimitExceeded}!void {
+        if (total > cap) return error.LimitExceeded;
+    }
+
     /// `take` for a **schema-unbounded** `string`/`blob` field, bounded by the
     /// receiver cap `cap` the caller supplies (CORELIB_PLAN §6.2.1).
     ///
@@ -597,4 +623,21 @@ test "PayloadAcc reports an allocation failure rather than swallowing it" {
         error.OutOfMemory,
         acc.push(std.testing.failing_allocator, 3, 0, "abc"),
     );
+}
+
+test "PayloadAcc.beginCapped answers at the length header, with no payload byte" {
+    // The header of a 100-byte string, and nothing behind it: `takeCapped`
+    // cannot run at all, because `string()` is never called. `beginCapped` is
+    // the comparison a generated `fixlenBegin` makes instead (CORELIB_PLAN
+    // §6.2.1) — and it admits a length the cap allows, so a short read of an
+    // in-cap field stays INCOMPLETE rather than becoming a rejection.
+    var acc: PayloadAcc = .{};
+    defer acc.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.LimitExceeded, acc.beginCapped(100, 16));
+    try acc.beginCapped(16, 16); // at the cap: admitted, never clamped
+    try acc.beginCapped(8, 16);
+    try acc.beginCapped(0, 0); // the empty payload is not a breach of a zero cap
+    // The amplification shape: a gigabyte claimed in six header bytes.
+    try std.testing.expectError(error.LimitExceeded, acc.beginCapped(1 << 30, 16));
 }

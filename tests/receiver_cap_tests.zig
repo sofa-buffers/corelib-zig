@@ -136,12 +136,16 @@ test "an over-cap array count is refused at the header, before any allocation" {
     // can see does end the decode: raising `error.LimitExceeded` out of
     // `fixlenBegin` latches it, and every later `feed` raises that same code
     // (src/istream.zig).
-    // This refusal the decoder never sees. `arrayBegin` is infallible by
-    // design, so the cap is compared inside the callback and the verdict is
-    // held in `v.lim` for generated `decode` to report; the decoder consumed a
-    // well-formed message whole, and `.complete` is its truthful answer about
-    // the bytes. That a cap enforced on this route cannot terminate the decode
-    // is a gap in the callback contract, not a property of policy rejections.
+    // This refusal the decoder never sees, because *this visitor* declares
+    // `arrayBegin` infallible: the cap is compared inside the callback and the
+    // verdict is held in `v.lim` for generated `decode` to report; the decoder
+    // consumed a well-formed message whole, and `.complete` is its truthful
+    // answer about the bytes. Declaring `arrayBegin` as `Error!void` instead
+    // routes the same refusal onto the decoder's error channel, where it is
+    // terminal — which is what a truncated count word needs, and what
+    // `tests/header_limits_tests.zig` exercises. The infallible form is kept
+    // here on purpose: it is the shape whose allocator behaviour these tests
+    // measure, and it must keep working unchanged.
     try std.testing.expectEqual(sofab.Status.complete, st);
 }
 

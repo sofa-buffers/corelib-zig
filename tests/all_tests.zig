@@ -12,6 +12,7 @@ test {
     _ = @import("limit_terminal_tests.zig");
     _ = @import("no_allocation_tests.zig");
     _ = @import("sequence_growth_tests.zig");
+    _ = @import("header_limits_tests.zig");
     _ = @import("fixlen_array_kind_tests.zig");
     _ = @import("sequence_skip_tests.zig");
     _ = @import("api_tests.zig");

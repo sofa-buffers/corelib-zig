@@ -101,8 +101,11 @@ pub const CollectingSink = @import("support.zig").CollectingSink;
 /// stitched from the pieces when a feed boundary split it — and `takeCapped`
 /// is the same for a field the schema leaves unbounded, comparing the caller's
 /// `max_dyn_string_len` / `max_dyn_blob_len` against the announced length
-/// before any of that happens (CORELIB_PLAN §6.2.1). No limit is held,
-/// defaulted or retained here.
+/// before any of that happens (CORELIB_PLAN §6.2.1). `beginCapped` is that
+/// comparison alone, for a generated `fixlenBegin` to make at the **length
+/// header** — the enforcement point §6.2.1 names, and the only one that still
+/// answers when the message ends at the length word and no payload chunk ever
+/// reaches `takeCapped`. No limit is held, defaulted or retained here.
 pub const PayloadAcc = @import("support.zig").PayloadAcc;
 
 test {
