@@ -288,7 +288,7 @@ it and `OStream.writeString` refuse a non-UTF-8 value with
 `error.InvalidArgument` under strict (`blob` and the float subtypes are never
 validated). `sofab.STRICT_UTF8` reflects the compiled state. When the option is
 off, `utf8Valid` folds to `true` (no validator compiled in) and both writers emit
-bytes verbatim — never silent/lossy. A daily CI job (`.github/workflows/shared-vectors.yml`) compares the sha256 of this copy against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change shows up here rather than going unnoticed. Skipped fields are never validated. The
+bytes verbatim — never silent/lossy. Skipped fields are never validated. The
 validator rejects overlong forms including `C0 80`, surrogates, and code points
 above `U+10FFFF`, and accepts embedded `U+0000`.
 
