@@ -253,9 +253,16 @@ for one call. Every comparison runs **here**, at the header that announces the
 size and before anything is sized from it. The **array** cap goes to
 `sofab.arrays.allocNCapped`, `growCapped` and `setElemCapped`, at the count or
 element index; the **string** and **blob** caps go to
-`sofab.PayloadAcc.takeCapped`, at the payload's announced length, ahead of the
-copy or the stitch that would otherwise commit it. No cap is raised twice:
-whichever side checks, the other does not. `error.LimitExceeded` is distinct
+`sofab.PayloadAcc.beginCapped`, at the payload's announced length, and to
+`takeCapped` again ahead of the copy or the stitch that would otherwise commit
+it. The announced length is the point that matters, because a message may
+**end at the header**: `02 a2 06` declares a hundred-byte string and stops, so
+nothing ever reaches a payload callback and a cap living only there would never
+fire. Both header hooks are declared fallible for that reason — raise
+`error.LimitExceeded` out of `fixlenBegin` or `arrayBegin` and the decoder
+latches it, so the refusal is terminal rather than an `.incomplete` a further
+`feed` would continue past. No cap is raised twice: whichever side checks, the
+other does not. `error.LimitExceeded` is distinct
 from `error.InvalidMessage` — a receiver limit is policy, not wire
 malformation — and the format ceilings `ARRAY_MAX` and `FIXLEN_MAX` are not
 receiver caps: exceeding one is `error.InvalidMessage` (see
@@ -484,7 +491,7 @@ arguments.
 |---|---|
 | `sofab.FixedArray(T, N)` | a `count: N` array field: `N` elements of inline capacity plus the length actually carried |
 | `sofab.CollectingSink` | the flush sink behind a one-shot `encode()`, collecting the drained bytes into the caller's allocator |
-| `sofab.PayloadAcc` | one `string`/`blob` payload however it arrived — borrowed whole, copied whole, or stitched out of pieces — via `take` and the receiver-capped `takeCapped` |
+| `sofab.PayloadAcc` | one `string`/`blob` payload however it arrived — borrowed whole, copied whole, or stitched out of pieces — via `take` and the receiver-capped `beginCapped` / `takeCapped` |
 | `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `at`, and the receiver-capped `allocNCapped` / `growCapped` / `setElemCapped` |
 
 **`FixedArray` keeps its storage to itself**, so a length can never be left
@@ -512,11 +519,15 @@ came whole but the caller must not borrow (the streaming path, where a payload
 completing inside the decoder's reused carry buffer would be overwritten by the
 next stitched item), stitched when it came in pieces. It is the entry point for
 a field the schema bounds with `maxlen`, whose violation is `INVALID` and the
-caller's to decide. `takeCapped` is for a field the schema leaves unbounded: it
-compares `max_dyn_string_len` / `max_dyn_blob_len` against the **announced
-length**, before a byte is borrowed, copied or appended, so an over-cap payload
-costs nothing at all. Comparing afterwards would report the same refusal having
-already committed the memory it exists to deny.
+caller's to decide. `beginCapped` and `takeCapped` are for a field the schema
+leaves unbounded: both compare `max_dyn_string_len` / `max_dyn_blob_len` against
+the **announced length**, before a byte is borrowed, copied or appended, so an
+over-cap payload costs nothing at all. Comparing afterwards would report the
+same refusal having already committed the memory it exists to deny.
+`beginCapped` is the one a generated `fixlenBegin` calls, at the length word
+itself — the only place that still answers when the message ends there and no
+payload chunk is ever delivered; `takeCapped` stays the second line of defence
+for the payload that does arrive.
 
 **`CollectingSink`** is a sink the caller constructs with its own allocator and
 installs like any other flush target; the corelib still allocates nothing. It is

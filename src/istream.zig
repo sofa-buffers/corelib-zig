@@ -50,6 +50,13 @@
 //!     pub fn blob(self: *@This(), id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void { ... }
 //!     // `kind` names the element category — for a fixlen array its *subtype*
 //!     // (`.fp32` / `.fp64`), reported once the `fixlen_word` has been read.
+//!     // Announced at the **count word**, before the first element, and — like
+//!     // `fixlenBegin` — it may be declared fallible: return `sofab.Error!void`
+//!     // and raising rejects the field there, `error.LimitExceeded` for a
+//!     // receiver cap on the count (§6.2.1), which is terminal for the decoder
+//!     // (§6.3). Declaring it `void` keeps the infallible form; the decoder
+//!     // picks between the two at comptime, so neither costs the other
+//!     // anything.
 //!     pub fn arrayBegin(self: *@This(), id: sofab.Id, kind: sofab.ArrayKind, count: usize) void { ... }
 //!     // Declaring `sequenceBegin` is what opts a visitor into nested scopes:
 //!     // without it, every sub-sequence is skipped whole (children and
@@ -558,7 +565,7 @@ pub const IStream = struct {
                         const is_signed = wire == types.T_VARINTARRAY_SIGNED;
                         if (comptime @hasDecl(V, "arrayBegin")) {
                             if (!self.skipping(V))
-                                visitor.arrayBegin(id, if (is_signed) ArrayKind.signed else ArrayKind.unsigned, @intCast(count));
+                                try announceArray(visitor, id, if (is_signed) ArrayKind.signed else ArrayKind.unsigned, @intCast(count));
                         }
                         if (count > 0) {
                             self.state = .{ .array_int = .{
@@ -593,7 +600,7 @@ pub const IStream = struct {
                         // applying any schema bound to `count` (§4.8 step 3).
                         if (comptime @hasDecl(V, "arrayBegin")) {
                             if (!self.skipping(V))
-                                visitor.arrayBegin(id, if (fp64) ArrayKind.fp64 else ArrayKind.fp32, @intCast(count));
+                                try announceArray(visitor, id, if (fp64) ArrayKind.fp64 else ArrayKind.fp32, @intCast(count));
                         }
                         if (count > 0) {
                             self.state = .{ .array_fix = .{
@@ -718,6 +725,34 @@ inline fn emitFixlenValue(buf: []const u8, pos: usize, fp64: bool, id: Id, visit
     } else {
         const bits = std.mem.readInt(u32, (buf.ptr + pos)[0..4], .little);
         if (comptime @hasDecl(V, "fp32")) visitor.fp32(id, @bitCast(bits));
+    }
+}
+
+/// Announce an array at its **count word**, before the first element, calling
+/// the visitor's `arrayBegin` in whichever of its two forms the visitor declared.
+///
+/// `void` is the plain announcement. `Error!void` makes the callback a place a
+/// verdict can be *raised*, which is what CORELIB_PLAN §6.2.1 needs of the count
+/// header: a receiver cap on an array count "is decided at the count header",
+/// and §6.3 calls the refusal terminal. A cap compared inside an infallible
+/// callback can only set a flag the decoder never sees — the decode then runs
+/// on, the elements behind the refused count are still delivered, and a further
+/// `feed` consumes instead of repeating the verdict. That is the shape a
+/// declared-then-truncated count exposes: `03 64` announces 100 elements and the
+/// message ends, so nothing but the header itself can carry the answer.
+///
+/// The choice is made at comptime from the declared return type, so a visitor
+/// that keeps the infallible form pays nothing and needs no change — the two
+/// call sites below `try` a call that cannot fail. This mirrors `fixlenBegin`
+/// one field kind over, whose fallible form is the same mechanism for a
+/// length word.
+inline fn announceArray(visitor: anytype, id: Id, kind: ArrayKind, count: usize) Error!void {
+    const V = std.meta.Child(@TypeOf(visitor));
+    const ret = @typeInfo(@TypeOf(@field(V, "arrayBegin"))).@"fn".return_type.?;
+    if (comptime @typeInfo(ret) == .error_union) {
+        try visitor.arrayBegin(id, kind, count);
+    } else {
+        visitor.arrayBegin(id, kind, count);
     }
 }
 
@@ -1289,4 +1324,76 @@ test "decoder reuse via reset" {
     try testing.expectError(Error.InvalidMessage, is.feed(&.{0x07}, &sink));
     is.reset();
     try testing.expectEqual(Status.complete, try is.feed(buf[0..used], &sink));
+}
+
+test "a fallible arrayBegin refuses at the count word, and the refusal is terminal" {
+    // CORELIB_PLAN §6.2.1 puts a receiver cap on an array count at the **count
+    // header**; §6.3 makes the refusal terminal. `03 64` is the shape that only
+    // the header can answer: an unsigned array at id 0 declaring 100 elements,
+    // and the message ends before the first of them. A cap compared inside an
+    // infallible `arrayBegin` would set a flag the decoder never sees, so the
+    // decode would answer INCOMPLETE and a further feed would consume the
+    // elements that follow.
+    const Capper = struct {
+        counts: usize = 0,
+        pub fn arrayBegin(self: *@This(), _: Id, _: ArrayKind, count: usize) Error!void {
+            self.counts += 1;
+            if (count > 16) return Error.LimitExceeded;
+        }
+        pub fn unsigned(_: *@This(), _: Id, _: Unsigned) void {
+            unreachable; // nothing may be decoded after the refusal
+        }
+    };
+    var v: Capper = .{};
+    var is = IStream.init();
+    try testing.expectError(Error.LimitExceeded, is.feed(&.{ 0x03, 0x64 }, &v));
+    // Terminal: re-reported to an empty probe, and the elements that arrive
+    // after it are not consumed as a continuation of the refused array.
+    try testing.expectError(Error.LimitExceeded, is.feed(&.{}, &v));
+    try testing.expectError(Error.LimitExceeded, is.feed(&.{ 0x01, 0x02 }, &v));
+    try testing.expectEqual(@as(usize, 1), v.counts);
+
+    // A count the cap admits is announced and decoded as before: the fallible
+    // form does not turn every array into a rejection. `03 08` declares 8
+    // elements; two of them arrive, so the message is INCOMPLETE.
+    is.reset();
+    const OkVisitor = struct {
+        seen: usize = 0,
+        pub fn arrayBegin(self: *@This(), _: Id, _: ArrayKind, count: usize) Error!void {
+            self.seen = count;
+        }
+        pub fn unsigned(_: *@This(), _: Id, _: Unsigned) void {}
+    };
+    var okv: OkVisitor = .{};
+    try testing.expectEqual(Status.incomplete, try is.feed(&.{ 0x03, 0x08, 0x01, 0x02 }, &okv));
+    try testing.expectEqual(@as(usize, 8), okv.seen);
+}
+
+test "an infallible arrayBegin is still accepted, and the fixlen-array arm dispatches too" {
+    // The two forms are chosen at comptime from the declared return type, so a
+    // visitor written before the fallible form existed needs no change — and
+    // both array arms (varint and fixlen) go through the same dispatch.
+    var p: Probe = .{};
+    var is = IStream.init();
+    // `03 08` + two elements: infallible, announced, no error.
+    try testing.expectEqual(Status.incomplete, try is.feed(&.{ 0x03, 0x08, 0x01, 0x02 }, &p));
+    try testing.expectEqual(@as(usize, 8), p.array_count);
+
+    // A fixlen (fp32) array: header (0 << 3) | 5 = 0x05, count 2, fixlen_word
+    // (4 << 3) | 0 = 0x20, and the message ends before the elements.
+    const FallibleFix = struct {
+        kind: ?ArrayKind = null,
+        count: usize = 0,
+        pub fn arrayBegin(self: *@This(), _: Id, kind: ArrayKind, count: usize) Error!void {
+            self.kind = kind;
+            self.count = count;
+            if (count > 1) return Error.LimitExceeded;
+        }
+    };
+    var f: FallibleFix = .{};
+    var is2 = IStream.init();
+    try testing.expectError(Error.LimitExceeded, is2.feed(&.{ 0x05, 0x02, 0x20 }, &f));
+    try testing.expectEqual(ArrayKind.fp32, f.kind.?);
+    try testing.expectEqual(@as(usize, 2), f.count);
+    try testing.expectError(Error.LimitExceeded, is2.feed(&.{}, &f));
 }
