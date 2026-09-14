@@ -6,6 +6,11 @@ ENV PATH=/opt/zig:$PATH
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    ripgrep \
+    fd-find \
+    shellcheck \
+    shfmt \
+    xxd \
     git \
     xz-utils \
     jq \
