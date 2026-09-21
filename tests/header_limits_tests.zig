@@ -38,8 +38,11 @@
 //! `feed` repeats it instead of resynchronizing on the bytes that follow. The
 //! comparison itself is the corelib's, as §6.2.1 permits ("a corelib MAY take a
 //! limit as an argument and perform the check itself"): `PayloadAcc.beginCapped`
-//! for a payload length, `arrays.allocNCapped` for an element count. The cap's
-//! *value* is the receiver's, supplied by the case and held nowhere.
+//! for a payload length. An element count is compared in the harness below
+//! instead of in `arrays.allocCounted`, because that helper's bound is a
+//! `comptime` parameter and this suite reads its ceiling from the case at
+//! runtime — see the note at `arrayBegin`. The cap's *value* is the receiver's,
+//! supplied by the case and held nowhere.
 //!
 //! **`requires` means SKIP here, for every tag** — not the reduced-build
 //! rejection a *vector* gets. These cases assert a rejection with a specific
@@ -70,12 +73,12 @@ pub const Capability = enum {
     /// a value or length outside the 32-bit range.
     int64,
     /// A **profile** capability: generated code carries §6.2.1 receiver caps
-    /// *distinct from* schema bounds. This port ships exactly that — the capped
-    /// half of its helper surface (`PayloadAcc.takeCapped` / `beginCapped`,
-    /// `arrays.allocNCapped` / `growCapped` / `setElemCapped`) exists for the
-    /// fields a schema leaves unbounded, and answers `LimitExceeded` rather than
-    /// the `INVALID` a schema `maxlen` breach gets. So the tag is satisfied and
-    /// the capped cases run.
+    /// *distinct from* schema bounds. This port ships exactly that — its helper
+    /// surface takes the bound as a value that says which rule governs
+    /// (`arrays.Bound.receiver` beside `arrays.Bound.schema`, and
+    /// `PayloadAcc.takeCapped` / `beginCapped`), so a field a schema leaves
+    /// unbounded answers `LimitExceeded` where a schema `maxlen` breach answers
+    /// `INVALID`. So the tag is satisfied and the capped cases run.
     receiver_caps,
 
     pub fn parse(tag: []const u8) Capability {
@@ -216,8 +219,20 @@ pub const Leaf = struct {
             .array_cap => |cap| {
                 // The destination is sized here, behind the cap — the check runs
                 // before the allocation it exists to prevent.
-                const dst = sofab.arrays.allocNCapped(u64, self.alloc, count, cap) catch
-                    return sofab.Error.LimitExceeded;
+                //
+                // The comparison is spelled out rather than routed through
+                // `sofab.arrays.allocCounted`, whose bound is a `comptime`
+                // parameter: generated code always knows the number statically
+                // (ARCHITECTURE §8), and that is what makes it fold to the same
+                // constant an emitted literal produced. This suite configures
+                // the ceiling per *case*, from the shared vectors, so the
+                // harness stands in for that literal. Nothing is lost: what
+                // these cases pin is the enforcement POINT — the count word,
+                // before anything is sized, and terminal — which belongs to the
+                // decoder, while the two verdicts of the comparison itself are
+                // unit-tested directly in `src/arrays.zig`.
+                if (count > cap) return sofab.Error.LimitExceeded;
+                const dst: []const u64 = self.alloc.alloc(u64, count) catch &.{};
                 self.taken = dst.len;
             },
             else => {},

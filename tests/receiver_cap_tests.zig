@@ -33,6 +33,9 @@ const CountingAllocator = @import("array_growth_tests.zig").CountingAllocator;
 /// This harness's stand-in for the generated `max_dyn_array_count`. The corelib
 /// has no cap of its own to offer and defaults none, so the number is here.
 const cap: usize = 4;
+/// The same number as the `Bound` the helpers take: this field is schema-
+/// unbounded, so a breach of it is `LimitExceeded` rather than `INVALID`.
+const cap_bound: sofab.arrays.Bound = .{ .receiver = cap };
 /// The same for `max_dyn_string_len`, and deliberately tiny next to the
 /// payloads below: the point is the distance between what is announced and what
 /// is allowed to be committed.
@@ -68,7 +71,7 @@ const Visitor = struct {
         switch (id) {
             // The §7.3 tag test: only an unsigned array is this field's value.
             1 => if (kind == .unsigned) {
-                self.m.dyn = sofab.arrays.allocNCapped(u32, self.alloc, count, cap) catch {
+                self.m.dyn = sofab.arrays.allocCounted(u32, cap_bound, self.alloc, count) catch {
                     self.lim = true;
                     return;
                 };
