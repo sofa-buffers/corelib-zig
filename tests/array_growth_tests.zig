@@ -19,6 +19,11 @@ const std = @import("std");
 const sofab = @import("sofab");
 const arrays = sofab.arrays;
 
+/// The element bound the geometry cases below run under. They measure growth,
+/// never a refusal, so it is wide enough that no id they use reaches it — which
+/// of the two `Bound` categories it is makes no difference to the geometry.
+const wide: arrays.Bound = .{ .receiver = 1 << 20 };
+
 /// An allocator that forwards to a child and counts what it was asked for.
 pub const CountingAllocator = struct {
     child: std.mem.Allocator,
@@ -56,7 +61,7 @@ pub const CountingAllocator = struct {
 
 test "growth geometry: filling n elements costs O(log n) allocations, not n" {
     // The shape the generated decode path takes: `m.string_array = &.{}` and
-    // then one `setElem` per arriving element (§7.2 item 8).
+    // then one `placeElem` per arriving element (§7.2 item 8).
     for ([_]usize{ 100, 1000, 4000 }) |n| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -64,7 +69,7 @@ test "growth geometry: filling n elements costs O(log n) allocations, not n" {
         const a = counter.allocator();
 
         var s: []const []const u8 = &.{};
-        for (0..n) |i| arrays.setElem([]const u8, a, &s, i, "", "0123456789abcdef");
+        for (0..n) |i| try arrays.placeElem([]const u8, wide, a, &s, i, "", "0123456789abcdef");
 
         // The value is exactly as long as the ids demand — the geometry is in
         // the block behind it, never in the length.
@@ -94,7 +99,7 @@ test "growth geometry: a sparse array pays for its length, not for its ids" {
     const a = counter.allocator();
 
     var s: []const u32 = &.{};
-    for ([_]usize{ 0, 5, 6, 100, 4095 }) |id| arrays.setElem(u32, a, &s, id, 0, @intCast(id));
+    for ([_]usize{ 0, 5, 6, 100, 4095 }) |id| try arrays.placeElem(u32, wide, a, &s, id, 0, @intCast(id));
 
     try std.testing.expectEqual(@as(usize, 4096), s.len);
     try std.testing.expect(counter.calls <= 6);
@@ -106,9 +111,12 @@ test "an id gap is filled with the element default and shifts nothing (§7.2 ite
     defer arena.deinit();
     const a = arena.allocator();
 
+    // A schema-bounded array this time -- `count: 8` -- so the same placement
+    // runs under the INVALID category rather than the cap's.
+    const eight: arrays.Bound = .{ .schema = 8 };
     var s: []const []const u8 = &.{};
-    arrays.setElem([]const u8, a, &s, 0, "", "zero");
-    arrays.setElem([]const u8, a, &s, 3, "", "three");
+    try arrays.placeElem([]const u8, eight, a, &s, 0, "", "zero");
+    try arrays.placeElem([]const u8, eight, a, &s, 3, "", "three");
     try std.testing.expectEqual(@as(usize, 4), s.len);
     try std.testing.expectEqualStrings("zero", s[0]);
     try std.testing.expectEqualStrings("", s[1]);
@@ -117,58 +125,60 @@ test "an id gap is filled with the element default and shifts nothing (§7.2 ite
 
     // A lower id delivered afterwards lands in its own slot rather than
     // appending, and does not disturb its neighbours.
-    arrays.setElem([]const u8, a, &s, 1, "", "one");
+    try arrays.placeElem([]const u8, eight, a, &s, 1, "", "one");
     try std.testing.expectEqual(@as(usize, 4), s.len);
     try std.testing.expectEqualStrings("one", s[1]);
     try std.testing.expectEqualStrings("three", s[3]);
 
     // A repeated id replaces (MESSAGE_SPEC §7.4), never appends.
-    arrays.setElem([]const u8, a, &s, 3, "", "THREE");
+    try arrays.placeElem([]const u8, eight, a, &s, 3, "", "THREE");
     try std.testing.expectEqual(@as(usize, 4), s.len);
     try std.testing.expectEqualStrings("THREE", s[3]);
 }
 
 test "a rejected id leaves the container unextended, and a lower id still lands" {
     // The cap's *value* belongs to generated code (§6.2.1: "the codec never
-    // invents a limit of its own"), but the comparison is `setElemCapped`'s —
-    // §6.2.1 permits a corelib to take the number as an argument and check it.
-    // What the helper owes is that nothing was extended on the way to the
-    // refusal: no allocator call, no length change.
+    // invents a limit of its own"), but the comparison is `placeElem`'s — the
+    // bound rides in as a `Bound`, and §6.2.1 permits a corelib to take the
+    // number as an argument and check it. What the helper owes is that nothing
+    // was extended on the way to the refusal: no allocator call, no length
+    // change.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var counter: CountingAllocator = .{ .child = arena.allocator() };
     const a = counter.allocator();
 
     const cap: usize = 8;
+    const capped: arrays.Bound = .{ .receiver = cap };
     var s: []const u32 = &.{};
-    try arrays.setElemCapped(u32, a, &s, cap - 1, 0, 7, cap); // the last legal id
+    try arrays.placeElem(u32, capped, a, &s, cap - 1, 0, 7); // the last legal id
     try std.testing.expectEqual(cap, s.len);
 
     const before_len = s.len;
     const before_calls = counter.calls;
     try std.testing.expectError(
         sofab.Error.LimitExceeded,
-        arrays.setElemCapped(u32, a, &s, cap, 0, 9, cap),
+        arrays.placeElem(u32, capped, a, &s, cap, 0, 9),
     );
     try std.testing.expectEqual(before_len, s.len);
     try std.testing.expectEqual(before_calls, counter.calls);
 
     // …and the container is still usable for a lower id.
-    try arrays.setElemCapped(u32, a, &s, 2, 0, 42, cap);
+    try arrays.placeElem(u32, capped, a, &s, 2, 0, 42);
     try std.testing.expectEqual(cap, s.len);
     try std.testing.expectEqual(@as(u32, 42), s[2]);
     try std.testing.expectEqual(@as(u32, 7), s[cap - 1]);
 }
 
-test "grow keeps the elements it already held across a reallocation" {
+test "growth keeps the elements it already held across a reallocation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
     var s: []const u32 = &.{};
-    for (0..5) |i| arrays.setElem(u32, a, &s, i, 0, @intCast(i + 1));
+    for (0..5) |i| try arrays.placeElem(u32, wide, a, &s, i, 0, @intCast(i + 1));
     // Crosses two capacity boundaries at once.
-    try std.testing.expect(arrays.grow(u32, a, &s, 40, 0));
+    try std.testing.expect(try arrays.reserveElem(u32, wide, a, &s, 39, 0));
     try std.testing.expectEqual(@as(usize, 40), s.len);
     for (0..5) |i| try std.testing.expectEqual(@as(u32, @intCast(i + 1)), s[i]);
     for (5..40) |i| try std.testing.expectEqual(@as(u32, 0), s[i]);

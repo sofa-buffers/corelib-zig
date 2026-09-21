@@ -112,28 +112,45 @@ test "sofab.arrays is the closed set of helpers generated code calls (§6.1)" {
     // an inverted rule as current guidance. `last` addressed the final element
     // of a decode-allocated slice, from a wrapper-array shape the backend
     // stopped emitting when it moved to placing an element at its wire id
-    // (`setElem`/`grow`) instead of appending.
+    // instead of appending.
     //
     // `allocCapped` and `ARRAY_INIT_CAP` left with generator#396, which stopped
     // emitting them: a native array's count is now bounded before it is
-    // allocated from, so the destination is `allocN(count)` and there is nothing
-    // to cap the first allocation at. A helper with no emitted call site is
-    // exactly what this closed set exists to keep out — and `ARRAY_INIT_CAP` was
-    // besides "a limit the codec invented of its own", which §6.2.1 forbids.
+    // allocated from, so the destination is sized at exactly the checked count
+    // and there is nothing to cap the first allocation at. A helper with no
+    // emitted call site is exactly what this closed set exists to keep out —
+    // and `ARRAY_INIT_CAP` was besides "a limit the codec invented of its own",
+    // which §6.2.1 forbids.
     //
-    // `allocNCapped`, `growCapped` and `setElemCapped` are the receiver-capped
-    // forms of the three calls that size a destination (§6.2.1): the cap is an
-    // argument the generated call site passes for that one comparison, so they
-    // are the same closed set counted once more, not a limit this library
-    // holds. They are unrelated to the withdrawn `allocCapped`, which capped
-    // the first *reservation* of a growing array rather than refusing a count.
+    // The capped/uncapped *split* left with generator#587. `allocN` / `grow` /
+    // `setElem` took no bound at all, so the generator emitted the schema
+    // `count` in front of every one of them, while `allocNCapped` /
+    // `growCapped` / `setElemCapped` took the receiver cap as an argument.
+    // Both halves now ride one entry point apiece, with the bound a `comptime`
+    // `Bound` that says which rule governs and therefore which verdict a breach
+    // gets — so the rule has one implementation and the generated layer carries
+    // no copy of it (ARCHITECTURE §8).
+    //
+    // `overIndex` is published beside the three signatures because one site has
+    // no container operation to ride: a generated `fixlenBegin` bounds a string
+    // or blob element's index at the LENGTH word, where a message that ends
+    // right there must still be INVALID rather than INCOMPLETE (§5.2).
     inline for (.{
-        "putGrowing", "putChecked",   "grow",       "allocN",
-        "setElem",    "allocNCapped", "growCapped", "setElemCapped",
+        "putGrowing",   "putChecked", "at",          "Bound",
+        "overIndex",    "placeElem",  "reserveElem", "reserveRow",
+        "allocCounted",
     }) |name| {
         try std.testing.expect(@hasDecl(sofab.arrays, name));
     }
-    inline for (.{ "put", "trimTail", "last", "allocCapped", "ARRAY_INIT_CAP" }) |name| {
+    // The withdrawn names, plus the mechanics that are now private: growing and
+    // allocating are not reachable without a bound, which is what keeps the
+    // check from being skipped or duplicated.
+    inline for (.{
+        "put",            "trimTail",     "last",          "allocCapped",
+        "ARRAY_INIT_CAP", "grow",         "allocN",        "setElem",
+        "growCapped",     "allocNCapped", "setElemCapped", "growTo",
+        "allocExact",     "overCount",
+    }) |name| {
         try std.testing.expect(!@hasDecl(sofab.arrays, name));
     }
 }

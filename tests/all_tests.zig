@@ -12,6 +12,7 @@ test {
     _ = @import("limit_terminal_tests.zig");
     _ = @import("no_allocation_tests.zig");
     _ = @import("sequence_growth_tests.zig");
+    _ = @import("schema_bound_tests.zig");
     _ = @import("header_limits_tests.zig");
     _ = @import("header_limits_nested_tests.zig");
     _ = @import("boolean_tolerant_tests.zig");

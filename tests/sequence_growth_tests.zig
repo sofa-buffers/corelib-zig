@@ -23,9 +23,10 @@
 //!
 //! The cap's **value** is the collector's, supplied per call — the corelib has
 //! none to offer and defaults none. The **comparison** is `sofab.arrays`'
-//! (`growCapped`), which §6.2.1 permits: "a corelib MAY take a limit as an
-//! argument and perform the check itself". One implementation either way, so
-//! the collector does not also guard in front of the call.
+//! (`reserveElem`, through the `Bound` the collector hands it), which §6.2.1
+//! permits: "a corelib MAY take a limit as an argument and perform the check
+//! itself". One implementation either way, so the collector does not also guard
+//! in front of the call.
 //!
 //! Cases are keyed by a delivery sequence rather than by bytes, because two
 //! ports that grow differently emit identical bytes. Indices are cap-relative:
@@ -41,6 +42,11 @@ const growth_json = @embedFile("test_vectors");
 /// stand-in for the `max_dyn_array_count` generated code supplies (§6.2.1) —
 /// the corelib has no cap of its own to offer.
 const cap: usize = 8;
+
+/// The same number as the `Bound` the helpers take. This block's arrays are
+/// schema-**unbounded**, so the receiver cap is what governs their element index
+/// and a breach is `LimitExceeded` rather than `INVALID` (CORELIB_PLAN §6.2.1).
+const cap_bound: sofab.arrays.Bound = .{ .receiver = cap };
 
 // ---------------------------------------------------------------------------
 // the collector — sofab.arrays, driven the way generated decode drives it
@@ -79,7 +85,7 @@ fn Collector(comptime kind: Kind) type {
             // index before *anything* is sized — the payload copy below is this
             // harness's own storage (generated decode stores a view instead) and
             // is made only once the index has been admitted.
-            const grown = sofab.arrays.growCapped([]const u8, self.alloc, &self.out, id + 1, default, cap) catch {
+            const grown = sofab.arrays.reserveElem([]const u8, cap_bound, self.alloc, &self.out, id, default) catch {
                 self.limit_exceeded = true;
                 return;
             };
@@ -99,7 +105,7 @@ fn Collector(comptime kind: Kind) type {
             self.depth += 1;
             if (self.depth == 2 and kind == .structural) {
                 if (self.limit_exceeded) return;
-                const grown = sofab.arrays.growCapped(Element, self.alloc, &self.out, id + 1, default, cap) catch {
+                const grown = sofab.arrays.reserveElem(Element, cap_bound, self.alloc, &self.out, id, default) catch {
                     self.limit_exceeded = true;
                     return;
                 };

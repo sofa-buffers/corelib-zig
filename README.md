@@ -250,9 +250,10 @@ decode limit on an unbounded field (`max_dyn_array_count`, `max_dyn_string_len`,
 `max_dyn_blob_len`). This library holds no limit and defines no default value:
 the caps come from the sofabgen config, and each is a number the caller supplies
 for one call. Every comparison runs **here**, at the header that announces the
-size and before anything is sized from it. The **array** cap goes to
-`sofab.arrays.allocNCapped`, `growCapped` and `setElemCapped`, at the count or
-element index; the **string** and **blob** caps go to
+size and before anything is sized from it. The **array** cap rides into
+`sofab.arrays` as `Bound.receiver`, compared at the count or element index by
+whichever of `overIndex`, `placeElem`, `reserveElem`, `reserveRow` and
+`allocCounted` the field's shape calls; the **string** and **blob** caps go to
 `sofab.PayloadAcc.beginCapped`, at the payload's announced length, and to
 `takeCapped` again ahead of the copy or the stitch that would otherwise commit
 it. The announced length is the point that matters, because a message may
@@ -492,7 +493,7 @@ arguments.
 | `sofab.FixedArray(T, N)` | a `count: N` array field: `N` elements of inline capacity plus the length actually carried |
 | `sofab.CollectingSink` | the flush sink behind a one-shot `encode()`, collecting the drained bytes into the caller's allocator |
 | `sofab.PayloadAcc` | one `string`/`blob` payload however it arrived — borrowed whole, copied whole, or stitched out of pieces — via `take` and the receiver-capped `beginCapped` / `takeCapped` |
-| `sofab.arrays` | the decode-side array helpers — `putChecked`, `putGrowing`, `grow`, `setElem`, `allocN`, `at`, and the receiver-capped `allocNCapped` / `growCapped` / `setElemCapped` |
+| `sofab.arrays` | the decode-side array helpers — `placeElem`, `reserveElem`, `reserveRow`, `allocCounted`, `overIndex`, plus the element stores `putChecked` / `putGrowing` and the pointer helper `at` |
 
 **`FixedArray` keeps its storage to itself**, so a length can never be left
 disagreeing with the elements beside it. A schema `count` is a **capacity** and
@@ -501,16 +502,33 @@ the wire count is the length, so `.{}` is the empty array and
 past `N` sets the caller's `inv` flag — a wire count above the schema count is
 `INVALID`, never clamped.
 
-**`sofab.arrays` has two entry points per operation.** `allocN`, `grow` and
-`setElem` size a destination for a field the schema bounds: the wire count or
-element index has already been checked against that bound by the caller, and an
-over-bound value is `INVALID` there. `allocNCapped`, `growCapped` and
-`setElemCapped` take a receiver cap for a field the schema leaves unbounded and
-compare against it themselves, returning `error.LimitExceeded` at the count or
-index header before the destination is sized. A cap is never both passed and
-guarded, and never both applied and defaulted: the uncapped forms carry no
-limit, and an allocation failure keeps its own channel (an empty slice, or
-`false`) so it stays distinguishable from a refused count.
+**`sofab.arrays` takes the field's bound, and there is one entry point per
+operation.** Three signatures cover every wrapper array — `placeElem` puts a
+string or blob element at its wire id, `reserveElem` reserves the slot a struct,
+union or nested-array element is routed into, and `reserveRow` reserves a matrix
+row and sizes it at its announced count — with `allocCounted` beside them for
+the count-prefixed native array.
+
+Each takes a `comptime` `sofab.arrays.Bound` saying which rule governs the
+field, and therefore what breaching it is called: `.{ .schema = n }` for a
+declared `count: n`, where a breach contradicts the agreed schema and is
+`error.InvalidMessage`; `.{ .receiver = n }` for a receiver cap on a field the
+schema leaves unbounded, where the bytes are well formed and a breach is
+`error.LimitExceeded`. The two are never both in play and there is no third
+state, so the rule has exactly one implementation and generated code carries no
+copy of it — `Bound.Err()` even narrows the error set to the one verdict that
+bound can raise. The comparison runs at the count word or the element index,
+before the destination is sized, and an allocation failure keeps its own channel
+(an empty slice, or `false`) so it stays distinguishable from a refusal. Because
+the bound is `comptime`, the call lowers to the same comparison against the same
+constant an inline `if (id >= n)` would.
+
+`overIndex` is published beside them for the one site with no container
+operation to ride: a generated `fixlenBegin` bounds a string or blob element's
+index at the **length word**, where a message ending right there must still be
+`INVALID` rather than incomplete. That element's own `maxlen` is decided in the
+same place and is deliberately not a `Bound`: there is no sizing call here for
+it to ride.
 
 **`PayloadAcc` has the same two entry points.** `take` materializes one payload
 whichever way it arrived: handed straight back when it came whole and the

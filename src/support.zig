@@ -267,10 +267,12 @@ pub const PayloadAcc = struct {
     ///   it is copied, once;
     /// * the payload arrived **split**, and `push` stitches it.
     ///
-    /// **This is the schema-bounded entry point**, as `arrays.allocN` is: a
-    /// `maxlen` bound is the caller's to decide, and its violation is `INVALID`
-    /// (MESSAGE_SPEC §7.1), not a cap. A field the schema leaves unbounded goes
-    /// through `takeCapped`.
+    /// **This is the schema-bounded entry point**: a `maxlen` bound is decided
+    /// at the LENGTH word, in the caller's `fixlenBegin`, so that a message
+    /// ending right there is `INVALID` (MESSAGE_SPEC §7.1, §5.2) rather than
+    /// incomplete — there is no sizing call here for it to ride, which is why
+    /// `arrays.Bound` has no `maxlen` twin. A field the schema leaves unbounded
+    /// goes through `takeCapped`, whose cap this class does compare.
     pub fn take(
         self: *PayloadAcc,
         a: std.mem.Allocator,

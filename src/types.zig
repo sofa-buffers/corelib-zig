@@ -84,10 +84,11 @@ pub const Error = error{
     /// retain (CORELIB_PLAN §6.2.1). Where it is raised is split by field kind,
     /// and each rule has exactly one implementation:
     ///
-    /// * an **array** cap — `max_dyn_array_count` — is passed to
-    ///   `arrays.allocNCapped` / `arrays.growCapped` / `arrays.setElemCapped`,
-    ///   which compare and raise it, §6.2.1 permitting a corelib to "take a
-    ///   limit as an argument and perform the check itself";
+    /// * an **array** cap — `max_dyn_array_count` — rides into
+    ///   `arrays.overIndex` / `placeElem` / `reserveElem` / `reserveRow` /
+    ///   `allocCounted` as `arrays.Bound.receiver`, which compares and raises
+    ///   it, §6.2.1 permitting a corelib to "take a limit as an argument and
+    ///   perform the check itself";
     /// * a **string** or **blob** cap — `max_dyn_string_len`,
     ///   `max_dyn_blob_len` — is passed to `PayloadAcc.takeCapped`, which
     ///   compares it against the payload's announced length and raises it there,

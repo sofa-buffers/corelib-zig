@@ -73,16 +73,26 @@ pub const STRICT_UTF8 = @import("utf8.zig").STRICT_UTF8;
 
 /// Array helpers the generated **decode** path needs for array fields (bounded
 /// element stores, growth of a decode-owned destination, wrapper-array element
-/// placement). They carry no schema knowledge — the count, the element default,
-/// the allocator and, where the schema bounds nothing, the receiver cap are all
-/// passed in. Encoding an array needs no helper: it is written linearly and
-/// gap-free, trailing default elements included (MESSAGE_SPEC §3).
+/// placement). They carry no schema knowledge — the bound, the element default
+/// and the allocator are passed in, the element type is a type parameter.
+/// Encoding an array needs no helper: it is written linearly and gap-free,
+/// trailing default elements included (MESSAGE_SPEC §3).
 ///
-/// The three that size a destination come in two forms: `allocN` / `grow` /
-/// `setElem` for a field the schema bounds, and `allocNCapped` / `growCapped` /
-/// `setElemCapped` for one it does not, which take the caller's
-/// `max_dyn_array_count` and answer `error.LimitExceeded` at the count or index
-/// header (CORELIB_PLAN §6.2.1). No limit is held, defaulted or retained here.
+/// Three signatures cover every wrapper-array shape: `placeElem` puts a string
+/// or blob element at its wire id, `reserveElem` reserves the slot a struct,
+/// union or nested-array element is routed into, and `reserveRow` reserves a
+/// matrix row and sizes it at its announced count. `allocCounted` is the
+/// count-prefixed native array beside them.
+///
+/// Each takes the field's bound as a `comptime` `arrays.Bound`:
+/// `.{ .schema = n }` for a declared `count:`, whose breach is
+/// `error.InvalidMessage` (MESSAGE_SPEC §7.1), or `.{ .receiver = n }` for the
+/// caller's `max_dyn_array_count` on a field the schema leaves unbounded, whose
+/// breach is `error.LimitExceeded` (CORELIB_PLAN §6.2.1). Never both, and never
+/// neither — the bound has no unset state and no unlimited mode — so the rule
+/// has one implementation here and generated code emits no copy of it. No limit
+/// is held, defaulted or retained. The bound being *comptime* is what makes it
+/// fold to the same constant an emitted literal produced.
 pub const arrays = @import("arrays.zig");
 
 /// Storage for a `count: N` native array field: `N` elements of inline capacity
