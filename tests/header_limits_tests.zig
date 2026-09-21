@@ -58,9 +58,13 @@ const vectors_json = @embedFile("test_vectors");
 
 /// The tags a `header_limits` case can ask for. Unlike in `vectors_tests.zig`,
 /// an unsatisfied tag SKIPS the case rather than turning it into a negative one.
-const Capability = enum {
+pub const Capability = enum {
     /// a `string`/`blob` (or float) field — anything carrying a length word.
     fixlen,
+    /// nested sequences — the construct `header_limits_nested` needs to place
+    /// its field one or two frames down. This port has no switch that compiles
+    /// sequence decoding out, so the tag is satisfied.
+    sequence,
     /// an array field, i.e. anything carrying a count word.
     array,
     /// a value or length outside the 32-bit range.
@@ -74,21 +78,21 @@ const Capability = enum {
     /// the capped cases run.
     receiver_caps,
 
-    fn parse(tag: []const u8) Capability {
+    pub fn parse(tag: []const u8) Capability {
         return std.meta.stringToEnum(Capability, tag) orelse {
             std.debug.print("unknown `requires` capability tag: {s}\n", .{tag});
             @panic("teach this suite the capability tag rather than ignoring it");
         };
     }
 
-    fn supported(self: Capability) bool {
+    pub fn supported(self: Capability) bool {
         return switch (self) {
-            .fixlen, .array, .int64, .receiver_caps => true,
+            .fixlen, .sequence, .array, .int64, .receiver_caps => true,
         };
     }
 };
 
-fn skipped(case: std.json.Value) bool {
+pub fn skipped(case: std.json.Value) bool {
     const reqs = get(case, "requires") orelse return false;
     for (reqs.array.items) |r| {
         if (!Capability.parse(r.string).supported()) return true;
@@ -102,7 +106,7 @@ fn skipped(case: std.json.Value) bool {
 
 /// Which ceiling the case put in front of the field, and its value. Exactly one
 /// of `schema` / `limits` is present in a case, so exactly one arm is live.
-const Ceiling = union(enum) {
+pub const Ceiling = union(enum) {
     /// A schema `maxlen` on the field's declared type. Its breach is INVALID:
     /// the schema says these bytes are not a value of that field (§7.1).
     schema_maxlen: usize,
@@ -116,7 +120,7 @@ const Ceiling = union(enum) {
     /// `max_dyn_array_count` — the same rule for a count word.
     array_cap: usize,
 
-    fn of(case: std.json.Value) Ceiling {
+    pub fn of(case: std.json.Value) Ceiling {
         if (get(case, "schema")) |s| {
             std.debug.assert(get(case, "limits") == null); // §6.2.1: never both
             return .{ .schema_maxlen = @intCast(get(s, "maxlen").?.integer) };
@@ -131,22 +135,43 @@ const Ceiling = union(enum) {
         std.debug.print("unknown receiver cap: {s}\n", .{e.key_ptr.*});
         @panic("teach this suite the cap rather than running the case without one");
     }
+
+    /// The same ceiling, raised to `to` — the negative control's one move. The
+    /// *kind* is preserved on purpose: lifting a receiver cap in front of a
+    /// case whose ceiling is a schema bound would leave the bound at its own
+    /// value and prove nothing (and lifting both would let the case pass for
+    /// the other ceiling's reason).
+    pub fn lifted(self: Ceiling, to: usize) Ceiling {
+        return switch (self) {
+            .schema_maxlen => .{ .schema_maxlen = to },
+            .string_cap => .{ .string_cap = to },
+            .blob_cap => .{ .blob_cap = to },
+            .array_cap => .{ .array_cap = to },
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
 // the receiver — generated decode's shape, with the ceiling at the header word
 // ---------------------------------------------------------------------------
 
-/// The visitor a generated decoder emits for one schema-unbounded (or
-/// schema-bounded) field: an id test first, the ceiling compared at the header,
-/// and nothing sized before it has answered.
+/// The **leaf**: the read a generated decoder emits for one schema-unbounded
+/// (or schema-bounded) field — an id test first, the ceiling compared at the
+/// header, and nothing sized before it has answered.
+///
+/// For the flat block this *is* the whole visitor, since every case there puts
+/// its field at the top level. `header_limits_nested` wraps the same leaf in a
+/// frame chain and changes nothing else: the two blocks are required to differ
+/// in *where the field arrives* and in nothing else, so a nested case that
+/// passes proves the library's enforcement point, not a second comparison the
+/// nested runner made up for itself.
 ///
 /// Both `fixlenBegin` and `arrayBegin` are declared fallible, which is what puts
 /// the verdict on the decoder's own error channel and so makes it terminal
 /// (§6.3). A cap compared in `string()` instead never runs for these cases at
 /// all: the message ends at the length word, so no payload chunk is ever
 /// delivered.
-const Receiver = struct {
+pub const Leaf = struct {
     alloc: std.mem.Allocator,
     field_id: sofab.Id,
     ceiling: Ceiling,
@@ -156,7 +181,7 @@ const Receiver = struct {
     taken: usize = 0,
 
     pub fn fixlenBegin(
-        self: *Receiver,
+        self: *Leaf,
         id: sofab.Id,
         subtype: sofab.FixlenType,
         total: usize,
@@ -181,7 +206,7 @@ const Receiver = struct {
     }
 
     pub fn arrayBegin(
-        self: *Receiver,
+        self: *Leaf,
         id: sofab.Id,
         _: sofab.ArrayKind,
         count: usize,
@@ -199,13 +224,13 @@ const Receiver = struct {
         }
     }
 
-    pub fn string(self: *Receiver, id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void {
+    pub fn string(self: *Leaf, id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void {
         if (id != self.field_id) return;
         _ = .{ total, offset };
         self.taken += chunk.len;
     }
 
-    pub fn blob(self: *Receiver, id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void {
+    pub fn blob(self: *Leaf, id: sofab.Id, total: usize, offset: usize, chunk: []const u8) void {
         if (id != self.field_id) return;
         _ = .{ total, offset };
         self.taken += chunk.len;
@@ -216,27 +241,34 @@ const Receiver = struct {
 // case plumbing
 // ---------------------------------------------------------------------------
 
-fn get(v: std.json.Value, key: []const u8) ?std.json.Value {
+pub fn get(v: std.json.Value, key: []const u8) ?std.json.Value {
     return v.object.get(key);
 }
 
-fn parseCases(arena: std.mem.Allocator) []const std.json.Value {
+/// The cases of one top-level block of the shared asset. `header_limits_nested`
+/// is loaded through this same door, so both blocks see the same file and the
+/// same parse.
+pub fn parseBlock(arena: std.mem.Allocator, block_name: []const u8) []const std.json.Value {
     const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, vectors_json, .{}) catch
         @panic("failed to parse test_vectors.json");
-    const block = doc.object.get("header_limits") orelse return &.{};
+    const block = doc.object.get(block_name) orelse return &.{};
     return block.array.items;
+}
+
+fn parseCases(arena: std.mem.Allocator) []const std.json.Value {
+    return parseBlock(arena, "header_limits");
 }
 
 /// The three outcomes a case can state, plus the `complete` a decoder would
 /// report if it swallowed the header whole — kept distinct so a wrong answer
 /// prints as itself rather than as "not incomplete".
-const Outcome = enum {
+pub const Outcome = enum {
     complete,
     incomplete,
     invalid,
     limit_exceeded,
 
-    fn parse(s: []const u8) Outcome {
+    pub fn parse(s: []const u8) Outcome {
         return std.meta.stringToEnum(Outcome, s) orelse {
             std.debug.print("unknown expect.outcome: {s}\n", .{s});
             @panic("teach this suite the outcome rather than passing the case");
@@ -244,7 +276,7 @@ const Outcome = enum {
     }
 };
 
-fn classify(e: sofab.Error) Outcome {
+pub fn classify(e: sofab.Error) Outcome {
     return switch (e) {
         sofab.Error.InvalidMessage => .invalid,
         sofab.Error.LimitExceeded => .limit_exceeded,
@@ -260,7 +292,7 @@ fn classify(e: sofab.Error) Outcome {
 /// Feed the case's bytes — as `chunks` where it states them, else in one call —
 /// and report the outcome. Feeding stops at the first refusal, which is what a
 /// caller does.
-fn feedCase(is: *sofab.IStream, r: *Receiver, chunks: []const []const u8) Outcome {
+pub fn feedCase(is: *sofab.IStream, r: anytype, chunks: []const []const u8) Outcome {
     var last: sofab.Status = .complete;
     for (chunks) |c| {
         last = is.feed(c, r) catch |e| return classify(e);
@@ -273,7 +305,7 @@ fn feedCase(is: *sofab.IStream, r: *Receiver, chunks: []const []const u8) Outcom
 }
 
 /// The chunks a case is fed in: its `chunks` list, or the whole `serialized`.
-fn chunksOf(arena: std.mem.Allocator, case: std.json.Value) []const []const u8 {
+pub fn chunksOf(arena: std.mem.Allocator, case: std.json.Value) []const []const u8 {
     if (get(case, "chunks")) |cs| {
         const out = arena.alloc([]const u8, cs.array.items.len) catch @panic("OOM");
         for (cs.array.items, 0..) |c, i| out[i] = common.hexToBytes(arena, c.string);
@@ -287,7 +319,7 @@ fn chunksOf(arena: std.mem.Allocator, case: std.json.Value) []const []const u8 {
 /// Feed `chunk` to a decoder that has already refused, and require the same
 /// verdict back. Consuming the bytes instead — answering `.complete` or
 /// `.incomplete` about them — is the failure `expect.terminal` names.
-fn expectReRaise(is: *sofab.IStream, r: *Receiver, chunk: []const u8, want: Outcome) !void {
+pub fn expectReRaise(is: *sofab.IStream, r: anytype, chunk: []const u8, want: Outcome) !void {
     if (is.feed(chunk, r)) |st| {
         std.debug.print(
             "a terminal refusal consumed a further feed instead of re-raising: {s}\n",
@@ -303,7 +335,7 @@ fn runCase(arena: std.mem.Allocator, case: std.json.Value) !Outcome {
     const expect = get(case, "expect").?;
     const want = Outcome.parse(get(expect, "outcome").?.string);
 
-    var r: Receiver = .{
+    var r: Leaf = .{
         .alloc = arena,
         .field_id = @intCast(get(case, "field_id").?.integer),
         .ceiling = Ceiling.of(case),
