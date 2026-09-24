@@ -34,7 +34,7 @@ tools use the Linux process-CPU clock.
 Add the package to your project and wire up the `sofab` module:
 
 ```bash
-zig fetch --save git+https://github.com/sofa-buffers/corelib-zig#v0.10.0
+zig fetch --save git+https://github.com/sofa-buffers/corelib-zig#v0.11.0
 ```
 
 Pin the release with the `#`-ref: without one, `zig fetch` resolves whatever
