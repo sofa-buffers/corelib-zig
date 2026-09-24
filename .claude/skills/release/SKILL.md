@@ -9,7 +9,8 @@ disable-model-invocation: true
 
 **The git tag is the source of truth for the version.** Every file that states the
 version must already say it when the tag is pushed; `version-consistency.yml` runs
-on `v*` tag pushes and fails if `build.zig.zon` disagrees with the tag.
+on `v*` tag pushes and fails if the tag is not `vX.Y.Z`, or if `build.zig.zon` or the
+README's pinned `zig fetch` ref disagrees with it.
 
 **Tag format: a lowercase `v` followed by the semver, e.g. `v1.2.3`.** Never `V1.2.3`,
 never a bare `1.2.3`, and no suffix such as `v1.2.3-release`. `version-consistency.yml`

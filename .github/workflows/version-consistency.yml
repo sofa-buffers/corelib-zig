@@ -1,8 +1,12 @@
 name: "Version consistency"
 
-# The git tag is the source of truth for the version: the package manifest must
-# match it. Zig has exactly one manifest, `build.zig.zon`, so this workflow has
-# exactly one comparison to make.
+# The git tag is the source of truth for the version: every file that states the
+# version must match it. In this repo that is two places, each checked in its own
+# step:
+#   - build.zig.zon — the package manifest's `.version`;
+#   - README.md     — the pinned ref in the `zig fetch … #vX.Y.Z` install line.
+# A new place that carries the version needs a step here and a row in the
+# /release skill's table (.claude/skills/release/SKILL.md).
 #
 # Tags only: the comparison is only meaningful when there is a tag to compare
 # against. Between releases `build.zig.zon` may legitimately sit ahead of the
@@ -42,6 +46,16 @@ jobs:
           fi
           echo "REF_VERSION=$ref_version" >> "$GITHUB_ENV"
 
+      # Release tags are a lowercase `v` plus plain semver: `v1.2.3`. `v*` also
+      # matches `v1.2`, `v1.2.3-rc1` or `vfoo`; none of those is a release here.
+      - name: Check tag name (vX.Y.Z)
+        if: ${{ github.ref_type == 'tag' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag '$GITHUB_REF_NAME' is not of the form vX.Y.Z (lowercase v, plain semver)"; exit 1; }
+          echo "tag: $GITHUB_REF_NAME"
+
       - name: Check Zig package manifest (build.zig.zon)
         if: ${{ !cancelled() }}
         shell: bash
@@ -52,3 +66,21 @@ jobs:
           [[ -n "$version" ]] || { echo "::error::build.zig.zon: no .version field found"; exit 1; }
           [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] || { echo "::error::build.zig.zon version: '$version' != '$REF_VERSION'"; exit 1; }
           echo "build.zig.zon version: $version"
+
+      - name: Check README install ref (README.md)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Every `zig fetch` of this repo in the README pins a `#vX.Y.Z` ref, and
+          # every such ref must be the tag. There must be at least one: a README
+          # that lost its pinned install line would otherwise pass silently.
+          mapfile -t refs < <(grep -oP 'zig fetch\b.*github\.com/sofa-buffers/corelib-zig#v\K[^\s`]+' README.md || true)
+          (( ${#refs[@]} > 0 )) || { echo "::error file=README.md::no pinned 'zig fetch … corelib-zig#vX.Y.Z' install line found"; exit 1; }
+          if grep -nP 'zig fetch\b.*github\.com/sofa-buffers/corelib-zig(?!#v)' README.md; then
+            echo "::error file=README.md::a 'zig fetch' of corelib-zig without a #vX.Y.Z ref"; exit 1
+          fi
+          for v in "${refs[@]}"; do
+            [[ -z "$REF_VERSION" || "$v" == "$REF_VERSION" ]] || { echo "::error file=README.md::README zig fetch ref: 'v$v' != 'v$REF_VERSION'"; exit 1; }
+          done
+          echo "README.md zig fetch ref(s): ${refs[*]/#/v}"
