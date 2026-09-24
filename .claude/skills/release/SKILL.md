@@ -120,22 +120,29 @@ under the pre-1.0 rule that a minor bump may break API or wire output.>
 
 Push the branch and open the PR titled `chore(release): X.Y.Z`. Base the body on the
 commit body, and say whether the generator (sofabgen) changed in lockstep. Wait until
-every CI check is green (`gh pr checks --watch`), then merge with a **merge commit**
-(as #29) and delete the branch:
+every CI check is green (`gh pr checks --watch`), then merge it and delete the branch.
+The repo allows **rebase merges only** (merge commits and squash are disabled, so
+`main` is linear). #29 was a merge commit from before that was switched off:
 
 ```bash
-gh pr merge --merge --delete-branch
+gh pr merge --rebase --delete-branch
 git checkout main && git pull -p
+git log -1 --oneline                              # the rebased chore(release) commit
 ```
+
+If `gh pr merge` fails, the branch and PR are untouched. Check the allowed methods
+(`gh api repos/sofa-buffers/corelib-zig -q '{merge:.allow_merge_commit, squash:.allow_squash_merge, rebase:.allow_rebase_merge}'`)
+and don't delete the local branch until the PR shows MERGED.
 
 ### 5. Tag — checkpoint
 
-Before tagging, show the user the merge commit (`git log -1 --oneline`), the version
+Before tagging, show the user the release commit on `main` (`git log -1 --oneline`), the version
 and the release notes draft (step 6). Get an explicit go-ahead. Once the tag is
 pushed, it's public.
 
-Tag the **merge commit on `main`** with an **annotated** tag, as v0.9.0 was (v0.10.0
-was lightweight by accident):
+Tag the **release commit on `main`** (the rebase gives it a new SHA, so tag
+`origin/main`, not the branch's commit) with an **annotated** tag, as v0.9.0 and
+v0.11.0 were (v0.10.0 was lightweight by accident):
 
 ```bash
 [[ "v$V" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag name: v$V"; exit 1; }
@@ -163,8 +170,13 @@ Notes, in the shape of the v0.10.0 release:
 ### 7. Verify the published package
 
 ```bash
-cd "$(mktemp -d)" && zig fetch "git+https://github.com/sofa-buffers/corelib-zig#v$V"
+cd "$(mktemp -d)" && zig init >/dev/null && \
+  zig fetch --save "git+https://github.com/sofa-buffers/corelib-zig#v$V"
+grep -A2 sofa_buffers_corelib build.zig.zon
 ```
 
-The fetch must succeed and print a hash. Report the release URL, the tag's commit
+Zig 0.16's `zig fetch` needs a project to run in; in a bare empty directory it fails
+with "no build.zig file found", hence the `zig init`. The fetch must succeed. The
+saved `.url` must name `?ref=vX.Y.Z#<the tagged commit>`, and the `.hash` must start
+with `sofa_buffers_corelib-X.Y.Z-`. Report the release URL, the tag's commit
 and that hash to the user.
