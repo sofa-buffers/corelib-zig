@@ -155,6 +155,14 @@ test "sofab.arrays is the closed set of helpers generated code calls (§6.1)" {
     }
 }
 
+test "sofab.floats is the bit-exact float-array equality generated code calls" {
+    try std.testing.expect(@hasDecl(sofab.floats, "bitsEqual"));
+    // A call site passes the field's slice and a literal default, as it did to
+    // `std.mem.eql`, and `-0.0` is not `0.0`.
+    try std.testing.expect(sofab.floats.bitsEqual(f32, &.{ 0.0, 1.5 }, &.{ 0.0, 1.5 }));
+    try std.testing.expect(!sofab.floats.bitsEqual(f64, &.{ -0.0, 1.5 }, &.{ 0.0, 1.5 }));
+}
+
 test "the generated layer's support types are exported (ARCHITECTURE §8)" {
     // Schema-free types the generator used to emit a copy of into every module:
     // the capacity is a type parameter, the allocator and the payload length are
