@@ -95,6 +95,14 @@ pub const STRICT_UTF8 = @import("utf8.zig").STRICT_UTF8;
 /// fold to the same constant an emitted literal produced.
 pub const arrays = @import("arrays.zig");
 
+/// The float-array helper a generated **encode** path calls to decide whether
+/// a field still holds its default: `floats.bitsEqual(T, a, b)` is true iff the
+/// lengths match and every element has the same IEEE-754 bit pattern, so `-0.0`
+/// differs from `0.0` and a NaN equals another NaN only bit for bit
+/// (MESSAGE_SPEC §2, CORELIB_PLAN §4.6). `std.mem.eql` on floats is an IEEE
+/// `==` and gets both wrong. Schema-free, allocation-free.
+pub const floats = @import("floats.zig");
+
 /// Storage for a `count: N` native array field: `N` elements of inline capacity
 /// plus the length actually carried, because a schema `count` is a capacity and
 /// the wire count is the length (MESSAGE_SPEC §3). The capacity is a type
@@ -124,6 +132,7 @@ test {
     _ = @import("ostream.zig");
     _ = @import("istream.zig");
     _ = @import("arrays.zig");
+    _ = @import("floats.zig");
     _ = @import("utf8.zig");
     _ = @import("support.zig");
 }

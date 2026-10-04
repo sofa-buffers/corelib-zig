@@ -493,6 +493,7 @@ arguments.
 | `sofab.FixedArray(T, N)` | a `count: N` array field: `N` elements of inline capacity plus the length actually carried |
 | `sofab.CollectingSink` | the flush sink behind a one-shot `encode()`, collecting the drained bytes into the caller's allocator |
 | `sofab.PayloadAcc` | one `string`/`blob` payload however it arrived — borrowed whole, copied whole, or stitched out of pieces — via `take` and the receiver-capped `beginCapped` / `takeCapped` |
+| `sofab.floats` | `bitsEqual(T, a, b)`, the encode-side default test for `f32`/`f64` arrays: equal length and equal IEEE-754 bit patterns, so `-0.0` differs from `0.0` and a NaN equals another NaN only bit for bit |
 | `sofab.arrays` | the decode-side array helpers — `placeElem`, `reserveElem`, `reserveRow`, `allocCounted`, `overIndex`, plus the element stores `putChecked` / `putGrowing` and the pointer helper `at` |
 
 **`FixedArray` keeps its storage to itself**, so a length can never be left
