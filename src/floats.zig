@@ -19,9 +19,11 @@ const std = @import("std");
 ///
 /// `+0.0` and `-0.0` differ; two NaNs are equal only when their bit patterns are
 /// identical; there is no IEEE `==` anywhere. The lengths are compared first, so
-/// a mismatch costs no element read. The elements are contiguous, so the rest is
-/// one block compare over their bytes — byte equality is bit equality on any
-/// endianness. No allocation, no mutation.
+/// a mismatch costs no element read. The elements are compared as unsigned
+/// integers of the same width (a bit cast, no float compare): one element at a
+/// time for short arrays, eight at a time (lane differences OR-ed together, so
+/// the compiler can use vector compares) for long ones, leaving at the first
+/// block that differs. No allocation, no mutation.
 ///
 /// Both operands are plain slices, so a call site passes the field's storage on
 /// one side and a literal default (`&.{ 0.0, 1.5 }`) on the other, exactly as it
@@ -29,7 +31,25 @@ const std = @import("std");
 pub fn bitsEqual(comptime T: type, a: []const T, b: []const T) bool {
     comptime if (T != f32 and T != f64) @compileError("bitsEqual: element type must be f32 or f64");
     if (a.len != b.len) return false;
-    return std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b));
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    var i: usize = 0;
+    // Long arrays: compare a block at a time, OR-ing the lane differences, so
+    // the compiler can use vector compares; one exit test per block.
+    const block = 8;
+    const V = @Vector(block, U);
+    // A first-element test keeps an early mismatch as cheap as in a scalar loop.
+    if (a.len >= block and @as(U, @bitCast(a[0])) != @as(U, @bitCast(b[0]))) return false;
+    while (a.len - i >= block) : (i += block) {
+        const x: V = @bitCast(a[i..][0..block].*);
+        const y: V = @bitCast(b[i..][0..block].*);
+        if (@reduce(.Or, x ^ y) != 0) return false;
+    }
+    // The tail (and every short array): one element at a time, leaving at the
+    // first difference.
+    while (i < a.len) : (i += 1) {
+        if (@as(U, @bitCast(a[i])) != @as(U, @bitCast(b[i]))) return false;
+    }
+    return true;
 }
 
 const testing = std.testing;
@@ -137,6 +157,16 @@ test "bitsEqual: long arrays with exactly one differing element" {
             b = a;
             b[at] = -0.0;
             try testing.expectEqual(refEqual(T, &a, &b), bitsEqual(T, &a, &b));
+        }
+        // A difference in the scalar tail after the last full block.
+        var tail: [203]T = undefined;
+        for (&tail, 0..) |*e, i| e.* = @floatFromInt(i);
+        for ([_]usize{ 0, 7, 8, 199, 200, 201, 202 }) |at| {
+            var c = tail;
+            try testing.expect(bitsEqual(T, &tail, &c));
+            c[at] = -1.5;
+            try testing.expect(!bitsEqual(T, &tail, &c));
+            try testing.expect(!bitsEqual(T, &c, &tail));
         }
         // Length mismatch on a long array, both directions.
         try testing.expect(!bitsEqual(T, a[0..199], a[0..200]));
